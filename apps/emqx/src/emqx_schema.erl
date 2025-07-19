@@ -267,6 +267,14 @@ roots(medium) ->
                     importance => ?IMPORTANCE_MEDIUM,
                     desc => ?DESC(durable_storage)
                 }
+            )},
+        {server_redirection,
+            sc(
+                ref("server_redirection"),
+                #{
+                    importance => ?IMPORTANCE_MEDIUM,
+                    desc => ?DESC(server_redirection)
+                }
             )}
     ];
 roots(low) ->
@@ -382,6 +390,8 @@ fields("authz_cache") ->
     ];
 fields("mqtt") ->
     mqtt_general() ++ mqtt_session();
+fields("server_redirection") ->
+    emqx_server_redirection_schema:fields("server_redirection");
 fields("zone") ->
     emqx_zone_schema:zones_without_default();
 fields("flapping_detect") ->
@@ -2052,6 +2062,11 @@ desc("authorization") ->
     "Settings for client authorization.";
 desc("mqtt") ->
     "Global MQTT configuration.";
+desc("server_redirection") ->
+    "MQTT v5 server redirection configuration.\n\n"
+    "This feature allows the broker to redirect clients to other servers when certain conditions are met,\n"
+    "such as when the current server reaches its maximum connection limit.\n\n"
+    "The redirection is implemented using the MQTT v5 Server-Reference property in CONNACK packets.";
 desc("authz_cache") ->
     "Settings for the authorization cache.";
 desc("zone") ->

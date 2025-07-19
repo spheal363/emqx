@@ -16,9 +16,9 @@
 ## Read more about configs here: {{ emqx_configuration_doc_log }}
 log {
     file {
-        # level = warning
+        level = debug
     }
     console {
-        # level = warning
+        level = debug
     }
 }

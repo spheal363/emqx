@@ -1294,6 +1294,10 @@ handle_frame_error(
     | {shutdown, Reason :: term(), channel()}
     | {shutdown, Reason :: term(), replies(), channel()}.
 handle_out(connack, {?RC_SUCCESS, SP, Props}, Channel = #channel{conninfo = ConnInfo}) ->
+    ?SLOG(error, #{msg => "connack_handle_out", conninfo => ConnInfo}),
+    ?SLOG(debug, #{
+        msg => "handle_out_connack_called", proto_ver => maps:get(proto_ver, ConnInfo, unknown)
+    }),
     AckProps = run_fold(
         [
             fun enrich_connack_caps/2,
@@ -1389,6 +1393,7 @@ handle_out(Type, Data, Channel) ->
 %%--------------------------------------------------------------------
 
 return_connack(?CONNACK_PACKET(_RC, _SessPresent) = AckPacket, Channel) ->
+    ?SLOG(debug, #{msg => "return_connack_called", ack_packet => AckPacket}),
     ?EXT_TRACE_ADD_ATTRS(#{'client.connack.reason_code' => _RC}),
     do_return_connack(AckPacket, Channel).
 
@@ -2673,7 +2678,12 @@ merge_default_subopts(SubOpts) ->
 %%--------------------------------------------------------------------
 %% Enrich ConnAck Caps
 
-enrich_connack_caps(AckProps, ?IS_MQTT_V5 = Channel) ->
+enrich_connack_caps(AckProps, Channel = ?IS_MQTT_V5) ->
+    ?SLOG(debug, #{
+        msg => "enrich_connack_caps_called",
+        ack_props => AckProps,
+        proto_ver => maps:get(proto_ver, Channel#channel.conninfo, unknown)
+    }),
     #channel{
         clientinfo = #{
             zone := Zone
@@ -2703,12 +2713,115 @@ enrich_connack_caps(AckProps, ?IS_MQTT_V5 = Channel) ->
     %% It is a Protocol Error to include Maximum QoS more than once,
     %% or to have a value other than 0 or 1. If the Maximum QoS is absent,
     %% the Client uses a Maximum QoS of 2.
-    case MaxQoS =:= 2 of
-        true -> NAckProps;
-        _ -> NAckProps#{'Maximum-QoS' => MaxQoS}
-    end;
+    NAckProps1 =
+        case MaxQoS =:= 2 of
+            true -> NAckProps;
+            _ -> NAckProps#{'Maximum-QoS' => MaxQoS}
+        end,
+    %% Add Server Reference and User Properties with cluster node information
+    ?SLOG(debug, #{msg => "about_to_call_add_cluster_info_to_connack", nack_props1 => NAckProps1}),
+    add_cluster_info_to_connack(NAckProps1);
 enrich_connack_caps(AckProps, _Channel) ->
+    ?SLOG(debug, #{msg => "enrich_connack_caps_not_mqtt_v5"}),
     AckProps.
+
+%%--------------------------------------------------------------------
+%% Add Server Reference and User Properties with cluster node information
+
+add_cluster_info_to_connack(AckProps) ->
+    ServerRefs = get_cluster_server_references(),
+    case ServerRefs of
+        [] ->
+            ?SLOG(debug, #{msg => "no_cluster_nodes_found, adding_current_node"}),
+            CurrentNodeRef = get_current_node_server_reference(),
+            case CurrentNodeRef of
+                undefined ->
+                    ?SLOG(debug, #{msg => "current_node_server_reference_not_found"}),
+                    AckProps;
+                ServerRef ->
+                    ?SLOG(debug, #{msg => "adding_current_node_info", server_ref => ServerRef}),
+                    %% Add User Properties with current node information only
+                    add_cluster_user_properties(AckProps, [ServerRef])
+            end;
+        ServerRefs ->
+            ?SLOG(debug, #{msg => "adding_cluster_info", server_refs => ServerRefs}),
+            %% Add User Properties with cluster information only
+            add_cluster_user_properties(AckProps, ServerRefs)
+    end.
+
+add_cluster_user_properties(AckProps, ServerRefs) ->
+    %% Get existing User Properties or create empty list
+    ExistingUserProps = maps:get('User-Property', AckProps, []),
+    %% Convert binary list to string list for string:join
+    ServerRefStrings = [binary_to_list(Ref) || Ref <- ServerRefs],
+    ?SLOG(debug, #{
+        msg => "add_cluster_user_properties_server_ref_strings",
+        server_ref_strings => ServerRefStrings
+    }),
+    case ServerRefStrings of
+        [] ->
+            ?SLOG(debug, #{msg => "add_cluster_user_properties_empty_strings"}),
+            AckProps;
+        _ ->
+            %% Add cluster information as User Properties
+            ClusterUserProps = [
+                {<<"cluster-nodes">>, list_to_binary(string:join(ServerRefStrings, ","))},
+                {<<"cluster-node-count">>, integer_to_binary(length(ServerRefs))},
+                {<<"current-node">>, atom_to_binary(node(), utf8)}
+            ],
+            %% Merge existing and new User Properties
+            AllUserProps = ExistingUserProps ++ ClusterUserProps,
+            ?SLOG(debug, #{msg => "adding_user_properties", user_props => AllUserProps}),
+            AckProps#{'User-Property' => AllUserProps}
+    end.
+
+get_cluster_server_references() ->
+    try
+        ?SLOG(debug, #{msg => "get_cluster_server_references_called_from_channel"}),
+        ServerRefs = emqx_server_redirection:get_cluster_server_references(),
+        ?SLOG(debug, #{
+            msg => "get_cluster_server_references_result_from_channel", server_refs => ServerRefs
+        }),
+        ServerRefs
+    catch
+        Error:Reason ->
+            ?SLOG(error, #{
+                msg => "get_cluster_server_references_error_from_channel",
+                error => Error,
+                reason => Reason
+            }),
+            []
+    end.
+
+get_current_node_server_reference() ->
+    try
+        ?SLOG(debug, #{msg => "get_current_node_server_reference_called"}),
+        %% Use fixed IP address and port for now
+        Host = <<"10.20.22.169">>,
+        Port = 1883,
+        ?SLOG(debug, #{
+            msg => "host_and_port_set",
+            host => Host,
+            port => Port,
+            host_type => erlang:is_binary(Host),
+            port_type => erlang:is_integer(Port)
+        }),
+        ?SLOG(debug, #{msg => "about_to_call_format_server_reference", host => Host, port => Port}),
+        ServerRef = emqx_server_redirection:format_server_reference(#{host => Host, port => Port}),
+        ?SLOG(debug, #{
+            msg => "current_node_server_reference_found",
+            host => Host,
+            port => Port,
+            server_ref => ServerRef
+        }),
+        ServerRef
+    catch
+        Error2:Reason ->
+            ?SLOG(error, #{
+                msg => "get_current_node_server_reference_error", error => Error2, reason => Reason
+            }),
+            undefined
+    end.
 
 %%--------------------------------------------------------------------
 %% Enrich server keepalive

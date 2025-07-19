@@ -1,0 +1,55 @@
+## MQTT v5 Server Redirection Configuration
+##
+## This feature allows the broker to redirect clients to other servers when certain conditions are met,
+## such as when the current server reaches its maximum connection limit.
+##
+## The redirection is implemented using the MQTT v5 Server-Reference property in CONNACK packets.
+##
+## Additionally, this feature automatically includes Server-Reference property in all CONNACK packets
+## with the IP addresses of all nodes in the EMQX cluster, allowing clients to discover available
+## cluster nodes for load balancing and failover scenarios.
+
+server_redirection {
+    ## Enable MQTT v5 server redirection functionality
+    ## Type: boolean
+    ## Default: false
+    enable = false
+
+    ## List of servers to redirect clients to
+    ## Type: array
+    ## Default: []
+    redirect_servers = [
+        {
+            ## Hostname or IP address of the redirect server
+            ## Type: string
+            ## Required: true
+            host = "server1.example.com"
+
+            ## Port number of the redirect server
+            ## Type: integer
+            ## Default: 1883
+            port = 1883
+
+            ## Optional description for the redirect server
+            ## Type: string
+            ## Default: ""
+            description = "Primary backup server"
+        },
+        {
+            host = "server2.example.com"
+            port = 1884
+            description = "Secondary backup server"
+        }
+    ]
+
+    ## Strategy for selecting redirect server
+    ## Type: enum
+    ## Options: random, round_robin
+    ## Default: random
+    redirect_strategy = random
+
+    ## Maximum number of connections before triggering redirection
+    ## Type: integer
+    ## Default: 1000
+    max_connections = 1000
+} 
