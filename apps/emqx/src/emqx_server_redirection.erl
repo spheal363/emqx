@@ -207,9 +207,9 @@ get_cluster_server_references() ->
     try
         Nodes = emqx:running_nodes(),
         ?SLOG(debug, #{msg => "get_cluster_server_references_called", nodes => Nodes}),
-        ServerRefs = lists:filtermap(fun get_node_server_reference/1, Nodes),
-        ?SLOG(debug, #{msg => "get_cluster_server_references_result", server_refs => ServerRefs}),
-        ServerRefs
+        NodeNames = lists:map(fun atom_to_binary/1, Nodes),
+        ?SLOG(debug, #{msg => "get_cluster_server_references_result", node_names => NodeNames}),
+        NodeNames
     catch
         Error:Reason ->
             ?SLOG(error, #{
