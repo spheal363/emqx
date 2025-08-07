@@ -37,7 +37,8 @@ init([]) ->
             child_spec(emqx_alarm),
             child_spec(emqx_sys_mon),
             child_spec(emqx_vm_mon),
-            child_spec(emqx_broker_mon)
+            child_spec(emqx_broker_mon),
+            child_spec(emqx_cpu_redirect)
         ] ++ OsMon,
     {ok, {{one_for_one, 10, 100}, Children}}.
 

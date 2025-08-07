@@ -2,8 +2,29 @@
 {application, emqx_dashboard, [
     {description, "EMQX Web Dashboard"},
     % strict semver, bump manually!
-    {vsn, "5.2.2"},
-    {modules, []},
+    {vsn, "5.2.3"},
+    {modules, [
+        emqx_dashboard,
+        emqx_dashboard_admin,
+        emqx_dashboard_app,
+        emqx_dashboard_api,
+        emqx_dashboard_audit,
+        emqx_dashboard_cli,
+        emqx_dashboard_desc_cache,
+        emqx_dashboard_error_code,
+        emqx_dashboard_error_code_api,
+        emqx_dashboard_listener,
+        emqx_dashboard_middleware,
+        emqx_dashboard_monitor,
+        emqx_dashboard_monitor_api,
+        emqx_dashboard_not_found,
+        emqx_dashboard_publisher_stats_api,
+        emqx_dashboard_schema,
+        emqx_dashboard_schema_api,
+        emqx_dashboard_sup,
+        emqx_dashboard_swagger,
+        emqx_dashboard_token
+    ]},
     {registered, [emqx_dashboard_sup]},
     {applications, [
         kernel, stdlib, mnesia, minirest, emqx, emqx_ctl, emqx_bridge_http

@@ -1,0 +1,290 @@
+%%--------------------------------------------------------------------
+%% Copyright (c) 2025 EMQ Technologies Co., Ltd. All Rights Reserved.
+%%
+%% Licensed under the Apache License, Version 2.0 (the "License");
+%% you may not use this file except in compliance with the License.
+%% You may obtain a copy of the License at
+%%
+%%     http://www.apache.org/licenses/LICENSE-2.0
+%%
+%% Unless required by applicable law or agreed to in writing, software
+%% distributed under the License is distributed on an "AS IS" BASIS,
+%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+%% See the License for the specific language governing permissions and
+%% limitations under the License.
+%%--------------------------------------------------------------------
+
+-module(emqx_cpu_redirect).
+
+-behaviour(gen_server).
+
+-include_lib("emqx/include/emqx.hrl").
+-include_lib("emqx/include/logger.hrl").
+
+-export([
+    start_link/0,
+    stop/0,
+    maybe_redirect_publisher/0
+]).
+
+%% gen_server callbacks
+-export([
+    init/1,
+    handle_call/3,
+    handle_cast/2,
+    handle_info/2,
+    terminate/2,
+    code_change/3
+]).
+
+-define(SERVER, ?MODULE).
+% 80%
+-define(CPU_HIGH_THRESHOLD, 80).
+% 60%
+-define(CPU_LOW_THRESHOLD, 60).
+% 30秒のクールダウン
+-define(REDIRECT_COOLDOWN, timer:seconds(30)).
+
+-record(state, {
+    last_redirect_time :: undefined | non_neg_integer()
+}).
+
+%%--------------------------------------------------------------------
+%% API
+%%--------------------------------------------------------------------
+
+-spec start_link() -> {ok, pid()} | {error, term()}.
+start_link() ->
+    gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
+
+-spec stop() -> ok.
+stop() ->
+    gen_server:call(?SERVER, stop, infinity).
+
+%% @doc CPU使用率が高い場合にpublisherをリダイレクト
+-spec maybe_redirect_publisher() -> ok.
+maybe_redirect_publisher() ->
+    gen_server:cast(?SERVER, maybe_redirect_publisher).
+
+%%--------------------------------------------------------------------
+%% gen_server callbacks
+%%--------------------------------------------------------------------
+
+init([]) ->
+    {ok, #state{last_redirect_time = undefined}}.
+
+handle_call(stop, _From, State) ->
+    {stop, normal, ok, State};
+handle_call(Req, _From, State) ->
+    ?SLOG(error, #{msg => "unexpected_call", call => Req}),
+    {reply, ignored, State}.
+
+handle_cast(maybe_redirect_publisher, State) ->
+    case should_redirect(State) of
+        true ->
+            case find_max_throughput_publisher() of
+                {ok, ClientId, Throughput} ->
+                    case find_low_cpu_nodes() of
+                        [] ->
+                            ?SLOG(warning, #{
+                                msg => "no_low_cpu_nodes_available",
+                                client_id => ClientId,
+                                throughput => Throughput
+                            });
+                        LowCpuNodes ->
+                            ServerReferences = format_server_references(LowCpuNodes),
+                            case disconnect_publisher(ClientId, ServerReferences) of
+                                ok ->
+                                    ?SLOG(info, #{
+                                        msg => "publisher_redirected",
+                                        client_id => ClientId,
+                                        throughput => Throughput,
+                                        server_references => ServerReferences,
+                                        target_nodes => LowCpuNodes
+                                    });
+                                {error, Reason} ->
+                                    ?SLOG(error, #{
+                                        msg => "failed_to_redirect_publisher",
+                                        client_id => ClientId,
+                                        reason => Reason
+                                    })
+                            end
+                    end;
+                {error, Reason} ->
+                    ?SLOG(warning, #{
+                        msg => "no_publishers_found",
+                        reason => Reason
+                    })
+            end,
+            {noreply, State#state{last_redirect_time = erlang:system_time(millisecond)}};
+        false ->
+            {noreply, State}
+    end;
+handle_cast(Msg, State) ->
+    ?SLOG(error, #{msg => "unexpected_cast", cast => Msg}),
+    {noreply, State}.
+
+handle_info(Info, State) ->
+    ?SLOG(error, #{msg => "unexpected_info", info => Info}),
+    {noreply, State}.
+
+terminate(_Reason, _State) ->
+    ok.
+
+code_change(_OldVsn, State, _Extra) ->
+    {ok, State}.
+
+%%--------------------------------------------------------------------
+%% Internal functions
+%%--------------------------------------------------------------------
+
+%% @doc リダイレクトすべきかチェック
+-spec should_redirect(#state{}) -> boolean().
+should_redirect(#state{last_redirect_time = LastTime}) ->
+    Now = erlang:system_time(millisecond),
+    case LastTime of
+        undefined ->
+            true;
+        _ when (Now - LastTime) > ?REDIRECT_COOLDOWN ->
+            true;
+        _ ->
+            false
+    end.
+
+%% @doc 最もスループットが大きいpublisherを特定
+-spec find_max_throughput_publisher() -> {ok, binary(), non_neg_integer()} | {error, term()}.
+find_max_throughput_publisher() ->
+    try
+        %% 全publisherの統計を取得
+        AllStats = emqx_publisher_stats:get_publisher_stats(),
+
+        %% 直近1秒のpublish数（スループット）を計算
+        CurrentTime = erlang:system_time(millisecond),
+        RecentStats = [
+            {maps:get(clientid, S), maps:get(publish_count, S, 0)}
+         || S <- AllStats,
+            maps:get(timestamp, S, 0) >= (CurrentTime - 1000)
+        ],
+
+        case RecentStats of
+            [] ->
+                {error, no_recent_publishers};
+            _ ->
+                %% スループットが最大のpublisherを特定
+                {ClientId, MaxThroughput} = lists:max(RecentStats),
+                {ok, ClientId, MaxThroughput}
+        end
+    catch
+        E:R:S ->
+            ?SLOG(error, #{
+                msg => "error_finding_max_throughput_publisher",
+                error => E,
+                reason => R,
+                stacktrace => S
+            }),
+            {error, {E, R}}
+    end.
+
+%% @doc CPU使用率が低いノードを特定
+-spec find_low_cpu_nodes() -> [node()].
+find_low_cpu_nodes() ->
+    try
+        Nodes = emqx:running_nodes(),
+        LowCpuNodes = lists:filter(
+            fun(Node) ->
+                case get_node_cpu_util(Node) of
+                    {ok, CpuUtil} when CpuUtil < ?CPU_LOW_THRESHOLD ->
+                        true;
+                    _ ->
+                        false
+                end
+            end,
+            Nodes
+        ),
+        LowCpuNodes
+    catch
+        E:R:S ->
+            ?SLOG(error, #{
+                msg => "error_finding_low_cpu_nodes",
+                error => E,
+                reason => R,
+                stacktrace => S
+            }),
+            []
+    end.
+
+%% @doc ノードのCPU使用率を取得
+-spec get_node_cpu_util(node()) -> {ok, float()} | {error, term()}.
+get_node_cpu_util(Node) ->
+    try
+        case Node =:= node() of
+            true ->
+                %% ローカルノードの場合
+                case emqx_vm:cpu_util() of
+                    {all, Use, _Idle, _} ->
+                        {ok, Use * 100};
+                    _ ->
+                        {error, cpu_util_not_available}
+                end;
+            false ->
+                %% リモートノードの場合
+                case erpc:call(Node, emqx_vm, cpu_util, [], 5000) of
+                    {all, Use, _Idle, _} ->
+                        {ok, Use * 100};
+                    _ ->
+                        {error, cpu_util_not_available}
+                end
+        end
+    catch
+        E:R ->
+            {error, {E, R}}
+    end.
+
+%% @doc Server Referenceをフォーマット
+-spec format_server_references([node()]) -> binary().
+format_server_references(Nodes) ->
+    Addresses = lists:map(fun node_to_address/1, Nodes),
+    iolist_to_binary(string:join(Addresses, ",")).
+
+%% @doc ノードをアドレスに変換
+-spec node_to_address(node()) -> string().
+node_to_address(Node) ->
+    %% ノード名からIPアドレスを抽出
+    NodeStr = atom_to_list(Node),
+    case string:split(NodeStr, "@") of
+        [_Name, Host] ->
+            Host;
+        _ ->
+            %% フォールバック: ノード名をそのまま使用
+            NodeStr
+    end.
+
+%% @doc publisherをdisconnect
+-spec disconnect_publisher(binary(), binary()) -> ok | {error, term()}.
+disconnect_publisher(ClientId, ServerReference) ->
+    try
+        %% クライアントのチャネルPIDを取得
+        case emqx_cm:lookup_channels(ClientId) of
+            [] ->
+                {error, client_not_found};
+            [{_ChanPid, _ChanInfo}] ->
+                %% チャネルにdisconnectメッセージを送信
+                ChanPid !
+                    {disconnect, ?RC_USE_ANOTHER_SERVER, use_another_server, #{
+                        'Server-Reference' => ServerReference
+                    }},
+                ok;
+            _ ->
+                {error, multiple_channels_found}
+        end
+    catch
+        E:R:S ->
+            ?SLOG(error, #{
+                msg => "error_disconnecting_publisher",
+                client_id => ClientId,
+                error => E,
+                reason => R,
+                stacktrace => S
+            }),
+            {error, {E, R}}
+    end.

@@ -50,6 +50,10 @@ stop_listeners() ->
 
 start_listeners(Listeners) ->
     {ok, _} = application:ensure_all_started(minirest),
+    %% キャッシュファイルを自動削除
+    DispatchFile = filename:join([code:priv_dir(emqx_dashboard), ?DISPATCH_FILE]),
+    %% エラーを無視
+    _ = file:delete(DispatchFile),
     SwaggerSupport = emqx:get_config([dashboard, swagger_support], true),
     InitDispatch = dispatch(),
     {OkListeners, ErrListeners} =

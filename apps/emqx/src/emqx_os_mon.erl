@@ -150,7 +150,9 @@ handle_info({timeout, _Timer, cpu_check}, State) ->
                     low_watermark => CPULowWatermark
                 },
                 usage_msg(Busy, cpu)
-            );
+            ),
+            %% CPU使用率が高い場合、publisherリダイレクトを試行
+            emqx_cpu_redirect:maybe_redirect_publisher();
         Busy when is_number(Busy) andalso Busy < CPULowWatermark ->
             ok = emqx_alarm:ensure_deactivated(
                 high_cpu_usage,
