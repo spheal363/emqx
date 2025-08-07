@@ -18,8 +18,9 @@
 
 -behaviour(gen_server).
 
--include_lib("emqx/include/emqx.hrl").
--include_lib("emqx/include/logger.hrl").
+-include("emqx.hrl").
+-include("emqx_mqtt.hrl").
+-include("logger.hrl").
 
 -export([
     start_link/0,
@@ -145,8 +146,11 @@ should_redirect(#state{last_redirect_time = LastTime}) ->
     case LastTime of
         undefined ->
             true;
-        _ when (Now - LastTime) > ?REDIRECT_COOLDOWN ->
-            true;
+        LastTime when is_integer(LastTime) ->
+            case (Now - LastTime) > ?REDIRECT_COOLDOWN of
+                true -> true;
+                false -> false
+            end;
         _ ->
             false
     end.
@@ -193,7 +197,7 @@ find_low_cpu_nodes() ->
         LowCpuNodes = lists:filter(
             fun(Node) ->
                 case get_node_cpu_util(Node) of
-                    {ok, CpuUtil} when CpuUtil < ?CPU_LOW_THRESHOLD ->
+                    {ok, CpuUtil} when is_number(CpuUtil) andalso CpuUtil < ?CPU_LOW_THRESHOLD ->
                         true;
                     _ ->
                         false
@@ -267,7 +271,7 @@ disconnect_publisher(ClientId, ServerReference) ->
         case emqx_cm:lookup_channels(ClientId) of
             [] ->
                 {error, client_not_found};
-            [{_ChanPid, _ChanInfo}] ->
+            [{ChanPid, _ChanInfo}] ->
                 %% チャネルにdisconnectメッセージを送信
                 ChanPid !
                     {disconnect, ?RC_USE_ANOTHER_SERVER, use_another_server, #{

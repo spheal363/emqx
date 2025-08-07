@@ -214,18 +214,6 @@ record_publish(ClientId, Topic) ->
             ets:insert(?TAB, {Key, NewStats})
     end.
 
-%% @doc 現在の秒キーを取得（"20250725132701"形式）
--spec get_current_second_key() -> second_key().
-get_current_second_key() ->
-    {Date, Time} = calendar:universal_time(),
-    {{Year, Month, Day}, {Hour, Min, Sec}} = {Date, Time},
-    list_to_binary(
-        io_lib:format(
-            "~4..0B~2..0B~2..0B~2..0B~2..0B~2..0B",
-            [Year, Month, Day, Hour, Min, Sec]
-        )
-    ).
-
 %% @doc 全Publisherの統計を収集
 -spec collect_all_stats() -> [publisher_stats()].
 collect_all_stats() ->
