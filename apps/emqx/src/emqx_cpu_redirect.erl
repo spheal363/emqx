@@ -25,7 +25,14 @@
 -export([
     start_link/0,
     stop/0,
-    maybe_redirect_publisher/0
+    maybe_redirect_publisher/0,
+    find_max_throughput_publisher/0,
+    find_low_cpu_nodes/0,
+    get_node_cpu_util/1,
+    format_server_references/1,
+    node_to_address/1,
+    disconnect_publisher/2,
+    should_redirect/1
 ]).
 
 %% gen_server callbacks
@@ -162,12 +169,12 @@ find_max_throughput_publisher() ->
         %% 全publisherの統計を取得
         AllStats = emqx_publisher_stats:get_publisher_stats(),
 
-        %% 直近1秒のpublish数（スループット）を計算
+        %% 直近10秒のpublish数（スループット）を計算
         CurrentTime = erlang:system_time(millisecond),
         RecentStats = [
             {maps:get(clientid, S), maps:get(publish_count, S, 0)}
          || S <- AllStats,
-            maps:get(timestamp, S, 0) >= (CurrentTime - 1000)
+            maps:get(timestamp, S, 0) >= (CurrentTime - 10000)
         ],
 
         case RecentStats of
@@ -194,6 +201,8 @@ find_max_throughput_publisher() ->
 find_low_cpu_nodes() ->
     try
         Nodes = emqx:running_nodes(),
+        %% 自身のノードを除外
+        OtherNodes = lists:delete(node(), Nodes),
         LowCpuNodes = lists:filter(
             fun(Node) ->
                 case get_node_cpu_util(Node) of
@@ -203,7 +212,7 @@ find_low_cpu_nodes() ->
                         false
                 end
             end,
-            Nodes
+            OtherNodes
         ),
         LowCpuNodes
     catch
@@ -225,16 +234,16 @@ get_node_cpu_util(Node) ->
             true ->
                 %% ローカルノードの場合
                 case emqx_vm:cpu_util() of
-                    {all, Use, _Idle, _} ->
-                        {ok, Use * 100};
+                    CpuUtil when is_number(CpuUtil) ->
+                        {ok, CpuUtil};
                     _ ->
                         {error, cpu_util_not_available}
                 end;
             false ->
                 %% リモートノードの場合
                 case erpc:call(Node, emqx_vm, cpu_util, [], 5000) of
-                    {all, Use, _Idle, _} ->
-                        {ok, Use * 100};
+                    CpuUtil when is_number(CpuUtil) ->
+                        {ok, CpuUtil};
                     _ ->
                         {error, cpu_util_not_available}
                 end
@@ -271,15 +280,26 @@ disconnect_publisher(ClientId, ServerReference) ->
         case emqx_cm:lookup_channels(ClientId) of
             [] ->
                 {error, client_not_found};
-            [{ChanPid, _ChanInfo}] ->
-                %% チャネルにdisconnectメッセージを送信
-                ChanPid !
-                    {disconnect, ?RC_USE_ANOTHER_SERVER, use_another_server, #{
-                        'Server-Reference' => ServerReference
-                    }},
-                ok;
-            _ ->
-                {error, multiple_channels_found}
+            Channels when is_list(Channels) ->
+                %% チャンネルの形式を確認して処理
+                case Channels of
+                    [{ChanPid, _ChanInfo} | _] when is_pid(ChanPid) ->
+                        %% チャンネル情報付きの形式
+                        ChanPid !
+                            {disconnect, ?RC_USE_ANOTHER_SERVER, use_another_server, #{
+                                'Server-Reference' => ServerReference
+                            }},
+                        ok;
+                    [ChanPid | _] when is_pid(ChanPid) ->
+                        %% PIDのみの形式
+                        ChanPid !
+                            {disconnect, ?RC_USE_ANOTHER_SERVER, use_another_server, #{
+                                'Server-Reference' => ServerReference
+                            }},
+                        ok;
+                    _ ->
+                        {error, invalid_channel_format}
+                end
         end
     catch
         E:R:S ->
