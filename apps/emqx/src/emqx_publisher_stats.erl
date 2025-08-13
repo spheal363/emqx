@@ -65,7 +65,7 @@
 }.
 
 % "20250725132701"形式
--type second_key() :: binary().
+-type second_key() :: non_neg_integer().
 
 %%--------------------------------------------------------------------
 %% API
@@ -116,17 +116,10 @@ clear_stats() ->
 clear_stats(ClientId) ->
     gen_server:call(?SERVER, {clear_stats, ClientId}, infinity).
 
-%% @doc 現在の秒キーを取得（"20250725132701"形式）
+%% @doc 現在の秒キーを取得（システム時間ベース）
 -spec get_current_second_key() -> second_key().
 get_current_second_key() ->
-    {Date, Time} = calendar:universal_time(),
-    {{Year, Month, Day}, {Hour, Min, Sec}} = {Date, Time},
-    list_to_binary(
-        io_lib:format(
-            "~4..0B~2..0B~2..0B~2..0B~2..0B~2..0B",
-            [Year, Month, Day, Hour, Min, Sec]
-        )
-    ).
+    erlang:system_time(second).
 
 %%--------------------------------------------------------------------
 %% gen_server callbacks
@@ -203,7 +196,7 @@ record_publish(ClientId, Topic) ->
             Stats = #{
                 clientid => ClientId,
                 publish_count => 1,
-                timestamp => erlang:system_time(millisecond),
+                timestamp => SecondKey,
                 topic => Topic
             },
             ets:insert(?TAB, {Key, Stats});
@@ -265,8 +258,8 @@ clear_publisher_stats(ClientId) ->
 %% @doc 古い統計をクリーンアップ
 -spec cleanup_old_stats() -> ok.
 cleanup_old_stats() ->
-    Now = erlang:system_time(millisecond),
-    CutoffTime = Now - (?RETENTION_SECONDS * 1000),
+    Now = erlang:system_time(second),
+    CutoffTime = Now - ?RETENTION_SECONDS,
     ets:foldl(
         fun({Key, Stats}, _Acc) ->
             Timestamp = maps:get(timestamp, Stats, 0),

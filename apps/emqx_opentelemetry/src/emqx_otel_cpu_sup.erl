@@ -69,11 +69,11 @@ init(Conf) ->
 handle_continue({setup, #{metrics := #{enable := true, interval := Interval}}}, State) ->
     %% start os_mon temporarily
     {ok, _} = application:ensure_all_started(os_mon),
-    %% The returned value of the first call to cpu_sup:util/0 or cpu_sup:util/1 by a
+    %% The returned value of the first call to cpu_sup:avg1/0 or cpu_sup:avg1/1 by a
     %% process will on most systems be the CPU utilization since system boot,
     %% but this is not guaranteed and the value should therefore be regarded as garbage.
     %% This also applies to the first call after a restart of cpu_sup.
-    _Val = cpu_sup:util(),
+    _Val = cpu_sup:avg1(),
     TRef = start_refresh_timer(Interval),
     {noreply, State#{interval => Interval, refresh_time_ref => TRef}}.
 
@@ -105,10 +105,10 @@ code_change(_OldVsn, State, _Extra) ->
 
 refresh(#{interval := Interval} = State) ->
     NState =
-        case cpu_sup:util([]) of
-            {all, Use, Idle, _} ->
-                U = floor(Use * 100) / 100,
-                I = ceil(Idle * 100) / 100,
+        case cpu_sup:avg1() of
+            CpuUtil when is_number(CpuUtil) ->
+                U = floor(CpuUtil * 100) / 100,
+                I = ceil((100 - CpuUtil) * 100) / 100,
                 State#{'cpu.use' => U, 'cpu.idle' => I};
             _ ->
                 State#{'cpu.use' => 0, 'cpu.idle' => 0}

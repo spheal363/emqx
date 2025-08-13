@@ -52,7 +52,7 @@ cpu_util(Args) ->
 
 %%--------------------------------------------------------------------
 %% gen_server callbacks
-%% simply handle cpu_sup:util/0,1 called in one process
+%% simply handle cpu_sup:avg1/0,1 called in one process
 %%--------------------------------------------------------------------
 
 start_link() ->
@@ -64,18 +64,18 @@ init([]) ->
 handle_continue(setup, undefined) ->
     %% start os_mon temporarily
     {ok, _} = application:ensure_all_started(os_mon),
-    %% The returned value of the first call to cpu_sup:util/0 or cpu_sup:util/1 by a
+    %% The returned value of the first call to cpu_sup:avg1/0 or cpu_sup:avg1/1 by a
     %% process will on most systems be the CPU utilization since system boot,
     %% but this is not guaranteed and the value should therefore be regarded as garbage.
     %% This also applies to the first call after a restart of cpu_sup.
-    _Val = cpu_sup:util(),
+    _Val = cpu_sup:avg1(),
     {noreply, #{}}.
 
 handle_call(cpu_util, _From, State) ->
-    Val = cpu_sup:util(),
+    Val = cpu_sup:avg1(),
     {reply, Val, State};
 handle_call({cpu_util, Args}, _From, State) ->
-    Val = erlang:apply(cpu_sup, util, Args),
+    Val = erlang:apply(cpu_sup, avg1, Args),
     {reply, Val, State};
 handle_call(Req, _From, State) ->
     ?SLOG(error, #{msg => "unexpected_call", call => Req}),

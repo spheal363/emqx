@@ -134,37 +134,97 @@ handle_info({timeout, _Timer, mem_check}, #{sysmem_high_watermark := HWM} = Stat
     Ref = start_mem_check_timer(),
     {noreply, State#{mem_time_ref => Ref}};
 handle_info({timeout, _Timer, cpu_check}, State) ->
-    CPUHighWatermark = emqx:get_config([sysmon, os, cpu_high_watermark]) * 100,
-    CPULowWatermark = emqx:get_config([sysmon, os, cpu_low_watermark]) * 100,
-    CPUVal = cpu_sup:util(),
-    case CPUVal of
+    %% コア数を取得して閾値を計算（コア数×0.8）
+    Cores = erlang:system_info(schedulers_online),
+    CPUThreshold = Cores * 0.8,
+    %% cpu_sup:avg1()はスケーリングされた値を返すので、256で割って実際のロードアベレージを取得
+    RawLoadAvg = cpu_sup:avg1(),
+    LoadAvg =
+        case RawLoadAvg of
+            Val when is_number(Val) -> Val / 256.0;
+            _ -> RawLoadAvg
+        end,
+    case LoadAvg of
         %% 0 or 0.0
-        Busy when Busy == 0 ->
-            ok;
-        Busy when is_number(Busy) andalso Busy > CPUHighWatermark ->
-            _ = emqx_alarm:activate(
-                high_cpu_usage,
-                #{
-                    usage => Busy,
-                    high_watermark => CPUHighWatermark,
-                    low_watermark => CPULowWatermark
-                },
-                usage_msg(Busy, cpu)
-            ),
-            %% CPU使用率が高い場合、publisherリダイレクトを試行
-            emqx_cpu_redirect:maybe_redirect_publisher();
-        Busy when is_number(Busy) andalso Busy < CPULowWatermark ->
+        Load when Load == 0 ->
+            %% ロードが0の場合はアラームを非アクティブ化
             ok = emqx_alarm:ensure_deactivated(
                 high_cpu_usage,
                 #{
-                    usage => Busy,
-                    high_watermark => CPUHighWatermark,
-                    low_watermark => CPULowWatermark
+                    load_avg => Load,
+                    threshold => CPUThreshold,
+                    cores => Cores
                 },
-                usage_msg(Busy, cpu)
+                usage_msg(Load, cpu)
             );
-        _Busy ->
+        Load when is_number(Load) ->
+            %% ロードアベレージをCPU使用率のパーセンテージに変換
+            %% ロードアベレージがコア数に近い場合、CPU使用率は高い
+            %% ロードアベレージがコア数の80%を超えた場合、CPU使用率が高いと判断
+            if
+                Load > CPUThreshold ->
+                    %% CPU使用率が閾値を超えた場合、アラームをアクティブ化
+                    case
+                        emqx_alarm:activate(
+                            high_cpu_usage,
+                            #{
+                                load_avg => Load,
+                                threshold => CPUThreshold,
+                                cores => Cores
+                            },
+                            usage_msg(Load, cpu)
+                        )
+                    of
+                        ok ->
+                            %% 新しいアラームが作成された場合、DISCONNECT処理を実行
+                            ?SLOG(warning, #{
+                                msg => "cpu_alarm_activated",
+                                load_avg => Load,
+                                threshold => CPUThreshold,
+                                cores => Cores
+                            }),
+                            emqx_cpu_redirect:maybe_redirect_publisher();
+                        {error, already_existed} ->
+                            %% アラームが既に存在する場合、DISCONNECT処理のみ実行
+                            ?SLOG(info, #{
+                                msg => "cpu_alarm_already_active",
+                                load_avg => Load,
+                                threshold => CPUThreshold,
+                                cores => Cores
+                            }),
+                            emqx_cpu_redirect:maybe_redirect_publisher();
+                        Error ->
+                            ?SLOG(error, #{
+                                msg => "failed_to_activate_cpu_alarm",
+                                error => Error,
+                                load_avg => Load,
+                                threshold => CPUThreshold
+                            })
+                    end;
+                true ->
+                    %% ロードアベレージが閾値以下の場合、アラームを非アクティブ化
+                    ok = emqx_alarm:ensure_deactivated(
+                        high_cpu_usage,
+                        #{
+                            load_avg => Load,
+                            threshold => CPUThreshold,
+                            cores => Cores
+                        },
+                        usage_msg(Load, cpu)
+                    ),
+                    ?SLOG(info, #{
+                        msg => "cpu_alarm_deactivated",
+                        load_avg => Load,
+                        threshold => CPUThreshold,
+                        cores => Cores
+                    })
+            end;
+        LoadError ->
             %% {error, timeout} ...
+            ?SLOG(warning, #{
+                msg => "cpu_monitor_timeout",
+                load_avg => LoadError
+            }),
             ok
     end,
     Ref = start_cpu_check_timer(),
@@ -246,8 +306,19 @@ do_update_mem_alarm_status(HWM0) ->
     end,
     ok.
 
+usage_msg(Usage, cpu) ->
+    %% CPUの場合はロードアベレージとして表示
+    %% 大きな値にも対応するため、適切なフォーマットを使用
+    case Usage of
+        Val when is_integer(Val) ->
+            iolist_to_binary(io_lib:format("~p load average", [Val]));
+        Val when is_float(Val) ->
+            iolist_to_binary(io_lib:format("~.2f load average", [Val]));
+        _ ->
+            iolist_to_binary(io_lib:format("~p load average", [Usage]))
+    end;
 usage_msg(Usage, What) ->
-    %% divide by 1.0 to ensure float point number
+    %% その他の場合はパーセンテージとして表示
     iolist_to_binary(io_lib:format("~.2f% ~p usage", [Usage / 1.0, What])).
 
 update_memory_protect_threshold(New) ->

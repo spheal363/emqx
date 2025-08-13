@@ -46,10 +46,7 @@
 ]).
 
 -define(SERVER, ?MODULE).
-% 80%
--define(CPU_HIGH_THRESHOLD, 80).
-% 60%
--define(CPU_LOW_THRESHOLD, 60).
+% コア数×0.8の閾値（動的に計算）
 % 30秒のクールダウン
 -define(REDIRECT_COOLDOWN, timer:seconds(30)).
 
@@ -169,20 +166,47 @@ find_max_throughput_publisher() ->
         %% 全publisherの統計を取得
         AllStats = emqx_publisher_stats:get_publisher_stats(),
 
-        %% 直近10秒のpublish数（スループット）を計算
-        CurrentTime = erlang:system_time(millisecond),
+        %% 直近60秒のpublish数（スループット）を計算
+        %% タイムスタンプが秒単位かミリ秒単位かを自動判定して処理
+        CurrentTime = erlang:system_time(second),
         RecentStats = [
             {maps:get(clientid, S), maps:get(publish_count, S, 0)}
          || S <- AllStats,
-            maps:get(timestamp, S, 0) >= (CurrentTime - 10000)
+            case maps:get(timestamp, S, 0) of
+                Timestamp when Timestamp > 1000000000000 ->
+                    %% ミリ秒単位（13桁以上）
+                    (Timestamp div 1000) >= (CurrentTime - 60);
+                Timestamp when Timestamp > 1000000000 ->
+                    %% 秒単位（10桁）
+                    Timestamp >= (CurrentTime - 60);
+                _ ->
+                    false
+            end
         ],
 
         case RecentStats of
             [] ->
                 {error, no_recent_publishers};
             _ ->
+                %% クライアント別のスループットを集計
+                ClientThroughput = lists:foldl(
+                    fun({ClientId, Count}, Acc) ->
+                        maps:update_with(ClientId, fun(V) -> V + Count end, Count, Acc)
+                    end,
+                    #{},
+                    RecentStats
+                ),
                 %% スループットが最大のpublisherを特定
-                {ClientId, MaxThroughput} = lists:max(RecentStats),
+                {ClientId, MaxThroughput} = maps:fold(
+                    fun(K, V, {MaxClient, MaxCount}) ->
+                        case V > MaxCount of
+                            true -> {K, V};
+                            false -> {MaxClient, MaxCount}
+                        end
+                    end,
+                    {<<>>, 0},
+                    ClientThroughput
+                ),
                 {ok, ClientId, MaxThroughput}
         end
     catch
@@ -203,10 +227,13 @@ find_low_cpu_nodes() ->
         Nodes = emqx:running_nodes(),
         %% 自身のノードを除外
         OtherNodes = lists:delete(node(), Nodes),
+        %% コア数×0.8の閾値を計算
+        Cores = erlang:system_info(schedulers_online),
+        CPUThreshold = Cores * 0.8,
         LowCpuNodes = lists:filter(
             fun(Node) ->
                 case get_node_cpu_util(Node) of
-                    {ok, CpuUtil} when is_number(CpuUtil) andalso CpuUtil < ?CPU_LOW_THRESHOLD ->
+                    {ok, CpuUtil} when is_number(CpuUtil) andalso CpuUtil < CPUThreshold ->
                         true;
                     _ ->
                         false

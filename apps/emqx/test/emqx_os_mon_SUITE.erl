@@ -180,12 +180,15 @@ do_sys_mem_check_alarm(_Config) ->
     ).
 
 t_cpu_check_alarm(_) ->
-    CpuUtil = 90.12345,
-    Usage = floor(CpuUtil * 100) / 100,
+    %% ロードアベレージの値
+    LoadAvg = 2.5,
+    %% コア数を取得して閾値を計算
+    Cores = erlang:system_info(schedulers_online),
+    CPUThreshold = Cores * 0.8,
     emqx_common_test_helpers:with_mock(
         cpu_sup,
-        util,
-        fun() -> CpuUtil end,
+        avg1,
+        fun() -> LoadAvg end,
         fun() ->
             timer:sleep(1000),
             Alarms = emqx_alarm:get_alarms(activated),
@@ -197,7 +200,9 @@ t_cpu_check_alarm(_) ->
                     activate_at := _,
                     activated := true,
                     deactivate_at := infinity,
-                    details := #{high_watermark := 90.0, low_watermark := 0, usage := RealUsage},
+                    details := #{
+                        load_avg := RealLoadAvg, threshold := RealThreshold, cores := RealCores
+                    },
                     message := Msg,
                     name := high_cpu_usage
                 }
@@ -209,13 +214,37 @@ t_cpu_check_alarm(_) ->
                     end,
                     Alarms
                 ),
-            ?assert(RealUsage >= Usage, {RealUsage, Usage}),
+            ?assert(RealLoadAvg =:= LoadAvg, {RealLoadAvg, LoadAvg}),
+            ?assert(RealThreshold =:= CPUThreshold, {RealThreshold, CPUThreshold}),
+            ?assert(RealCores =:= Cores, {RealCores, Cores}),
             ?assert(is_binary(Msg)),
-            emqx_config:put([sysmon, os, cpu_high_watermark], 1),
-            emqx_config:put([sysmon, os, cpu_low_watermark], 0.96),
-            timer:sleep(800),
-            ?assertNot(
-                emqx_vm_mon_SUITE:is_existing(high_cpu_usage, emqx_alarm:get_alarms(activated))
+
+            %% 2回目のチェック（アラームが既にアクティブな状態）
+            emqx_common_test_helpers:with_mock(
+                cpu_sup,
+                avg1,
+                fun() -> LoadAvg end,
+                fun() ->
+                    timer:sleep(100),
+                    %% アラームが既にアクティブな状態で、再度チェック
+                    %% この時点では既存のアラームが使用される
+                    ok
+                end
+            ),
+
+            %% ロードアベレージを閾値以下に下げる
+            emqx_common_test_helpers:with_mock(
+                cpu_sup,
+                avg1,
+                fun() -> CPUThreshold - 0.5 end,
+                fun() ->
+                    timer:sleep(800),
+                    Activated = emqx_alarm:get_alarms(activated),
+                    ?assertNot(
+                        emqx_vm_mon_SUITE:is_existing(high_cpu_usage, Activated),
+                        #{activated => Activated, process_state => sys:get_state(emqx_os_mon)}
+                    )
+                end
             )
         end
     ).
