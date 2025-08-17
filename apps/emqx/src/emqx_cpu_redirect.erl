@@ -231,20 +231,47 @@ find_low_cpu_nodes() ->
         Nodes = emqx:running_nodes(),
         %% 自身のノードを除外
         OtherNodes = lists:delete(node(), Nodes),
+        ?SLOG(debug, #{
+            msg => "finding_low_cpu_nodes",
+            total_nodes => Nodes,
+            other_nodes => OtherNodes
+        }),
         LowCpuNodes = lists:filter(
             fun(Node) ->
                 case get_node_cpu_util(Node) of
-                    {ok, CpuUtil} when is_number(CpuUtil) ->
+                    {ok, RawLoadAvg} when is_number(RawLoadAvg) ->
                         %% 各ノードの実際のコア数を取得して閾値を計算
                         NodeCores = get_node_cores(Node),
                         NodeThreshold = NodeCores * 0.8,
-                        CpuUtil < NodeThreshold;
-                    _ ->
+                        %% emqx_vm:cpu_util()は256でスケーリングされたロードアベレージを返す
+                        %% 256で割って実際のロードアベレージを取得
+                        ActualLoadAvg = RawLoadAvg / 256.0,
+                        IsLowCpu = ActualLoadAvg < NodeThreshold,
+                        ?SLOG(debug, #{
+                            msg => "node_cpu_check",
+                            node => Node,
+                            raw_load_avg => RawLoadAvg,
+                            actual_load_avg => ActualLoadAvg,
+                            cores => NodeCores,
+                            threshold => NodeThreshold,
+                            is_low_cpu => IsLowCpu
+                        }),
+                        IsLowCpu;
+                    {error, Reason} ->
+                        ?SLOG(debug, #{
+                            msg => "node_cpu_check_error",
+                            node => Node,
+                            error => Reason
+                        }),
                         false
                 end
             end,
             OtherNodes
         ),
+        ?SLOG(debug, #{
+            msg => "low_cpu_nodes_result",
+            low_cpu_nodes => LowCpuNodes
+        }),
         LowCpuNodes
     catch
         E:R:S ->
