@@ -227,14 +227,14 @@ find_low_cpu_nodes() ->
         Nodes = emqx:running_nodes(),
         %% 自身のノードを除外
         OtherNodes = lists:delete(node(), Nodes),
-        %% コア数×0.8の閾値を計算
-        Cores = erlang:system_info(schedulers_online),
-        CPUThreshold = Cores * 0.8,
         LowCpuNodes = lists:filter(
             fun(Node) ->
                 case get_node_cpu_util(Node) of
-                    {ok, CpuUtil} when is_number(CpuUtil) andalso CpuUtil < CPUThreshold ->
-                        true;
+                    {ok, CpuUtil} when is_number(CpuUtil) ->
+                        %% 各ノードの実際のコア数を取得して閾値を計算
+                        NodeCores = get_node_cores(Node),
+                        NodeThreshold = NodeCores * 0.8,
+                        CpuUtil < NodeThreshold;
                     _ ->
                         false
                 end
@@ -278,6 +278,36 @@ get_node_cpu_util(Node) ->
     catch
         E:R ->
             {error, {E, R}}
+    end.
+
+%% @doc ノードのコア数を取得
+-spec get_node_cores(node()) -> non_neg_integer().
+get_node_cores(Node) ->
+    try
+        case Node =:= node() of
+            true ->
+                %% ローカルノードの場合
+                erlang:system_info(schedulers_online);
+            false ->
+                %% リモートノードの場合
+                case erpc:call(Node, erlang, system_info, [schedulers_online], 5000) of
+                    Schedulers when is_integer(Schedulers) ->
+                        Schedulers;
+                    _ ->
+                        % エラー時は0を返す
+                        0
+                end
+        end
+    catch
+        E:R ->
+            ?SLOG(error, #{
+                msg => "error_getting_node_cores",
+                node => Node,
+                error => E,
+                reason => R
+            }),
+            % エラー時は0を返す
+            0
     end.
 
 %% @doc Server Referenceをフォーマット
