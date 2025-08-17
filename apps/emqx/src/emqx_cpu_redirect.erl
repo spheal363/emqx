@@ -32,7 +32,8 @@
     format_server_references/1,
     node_to_address/1,
     disconnect_publisher/2,
-    should_redirect/1
+    should_redirect/1,
+    get_local_node_info/0
 ]).
 
 %% gen_server callbacks
@@ -91,10 +92,13 @@ handle_cast(maybe_redirect_publisher, State) ->
                 {ok, ClientId, Throughput} ->
                     case find_low_cpu_nodes() of
                         [] ->
+                            %% 他のノードの情報も取得してログに含める
+                            OtherNodesInfo = get_other_nodes_info(),
                             ?SLOG(warning, #{
                                 msg => "no_low_cpu_nodes_available",
                                 client_id => ClientId,
-                                throughput => Throughput
+                                throughput => Throughput,
+                                other_nodes_info => OtherNodesInfo
                             });
                         LowCpuNodes ->
                             ServerReferences = format_server_references(LowCpuNodes),
@@ -367,5 +371,94 @@ disconnect_publisher(ClientId, ServerReference) ->
                 reason => R,
                 stacktrace => S
             }),
+            {error, {E, R}}
+    end.
+
+%% @doc 他のノードの情報を取得
+-spec get_other_nodes_info() -> [map()].
+get_other_nodes_info() ->
+    try
+        Nodes = emqx:running_nodes(),
+        %% 自身のノードを除外
+        OtherNodes = lists:delete(node(), Nodes),
+        lists:map(
+            fun(Node) ->
+                case get_node_info(Node) of
+                    {ok, Info} ->
+                        Info;
+                    {error, Reason} ->
+                        #{
+                            node => Node,
+                            error => Reason
+                        }
+                end
+            end,
+            OtherNodes
+        )
+    catch
+        E:R:S ->
+            ?SLOG(error, #{
+                msg => "error_getting_other_nodes_info",
+                error => E,
+                reason => R,
+                stacktrace => S
+            }),
+            []
+    end.
+
+%% @doc ノードの詳細情報を取得
+-spec get_node_info(node()) -> {ok, map()} | {error, term()}.
+get_node_info(Node) ->
+    try
+        case Node =:= node() of
+            true ->
+                %% ローカルノードの場合
+                Cores = erlang:system_info(schedulers_online),
+                Threshold = Cores * 0.8,
+                case emqx_vm:cpu_util() of
+                    LoadAvg when is_number(LoadAvg) ->
+                        {ok, #{
+                            node => Node,
+                            cores => Cores,
+                            load_avg => LoadAvg,
+                            threshold => Threshold,
+                            is_local => true
+                        }};
+                    _ ->
+                        {error, load_average_not_available}
+                end;
+            false ->
+                %% リモートノードの場合
+                case erpc:call(Node, ?MODULE, get_local_node_info, [], 5000) of
+                    {ok, Info} ->
+                        {ok, Info#{is_local => false}};
+                    {error, Reason} ->
+                        {error, Reason}
+                end
+        end
+    catch
+        E:R ->
+            {error, {E, R}}
+    end.
+
+%% @doc ローカルノードの情報を取得（リモートノードから呼び出される）
+-spec get_local_node_info() -> {ok, map()} | {error, term()}.
+get_local_node_info() ->
+    try
+        Cores = erlang:system_info(schedulers_online),
+        Threshold = Cores * 0.8,
+        case emqx_vm:cpu_util() of
+            LoadAvg when is_number(LoadAvg) ->
+                {ok, #{
+                    node => node(),
+                    cores => Cores,
+                    load_avg => LoadAvg,
+                    threshold => Threshold
+                }};
+            _ ->
+                {error, load_average_not_available}
+        end
+    catch
+        E:R ->
             {error, {E, R}}
     end.
