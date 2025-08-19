@@ -134,9 +134,9 @@ handle_info({timeout, _Timer, mem_check}, #{sysmem_high_watermark := HWM} = Stat
     Ref = start_mem_check_timer(),
     {noreply, State#{mem_time_ref => Ref}};
 handle_info({timeout, _Timer, cpu_check}, State) ->
-    %% コア数を取得して閾値を計算（コア数×0.8）
+    %% コア数を取得して閾値を計算（コア数×0.6）
     Cores = erlang:system_info(schedulers_online),
-    CPUThreshold = Cores * 0.8,
+    CPUThreshold = Cores * 0.6,
     %% cpu_sup:avg1()はスケーリングされた値を返すので、256で割って実際のロードアベレージを取得
     RawLoadAvg = cpu_sup:avg1(),
     LoadAvg =
