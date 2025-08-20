@@ -180,7 +180,7 @@ find_max_throughput_publisher() ->
                 Timestamp when Timestamp > 1000000000000 ->
                     %% ミリ秒単位（13桁以上）
                     (Timestamp div 1000) >= (CurrentTime - 10);
-                Timestamp when Timestamp > 1000000000000 ->
+                Timestamp when Timestamp > 1000000000 ->
                     %% 秒単位（10桁）
                     Timestamp >= (CurrentTime - 10);
                 _ ->
