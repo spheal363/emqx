@@ -63,7 +63,7 @@
     <<"
     sysmon {
       os {
-        cpu_check_interval = 60s
+        cpu_check_interval = 10s
         cpu_high_watermark = 80%
         cpu_low_watermark = 60%
         mem_check_interval = 60s

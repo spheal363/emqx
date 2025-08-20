@@ -49,8 +49,8 @@
 
 -define(SERVER, ?MODULE).
 -define(TAB, ?MODULE).
-% 1分ごとにクリーンアップ
--define(CLEANUP_INTERVAL, timer:seconds(60)).
+% 10秒ごとにクリーンアップ
+-define(CLEANUP_INTERVAL, timer:seconds(10)).
 % 1時間保持
 -define(RETENTION_SECONDS, 3600).
 

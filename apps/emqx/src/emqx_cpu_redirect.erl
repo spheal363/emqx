@@ -48,8 +48,8 @@
 
 -define(SERVER, ?MODULE).
 % コア数×0.6の閾値（動的に計算）
-% 30秒のクールダウン
--define(REDIRECT_COOLDOWN, timer:seconds(30)).
+% 8秒のクールダウン
+-define(REDIRECT_COOLDOWN, timer:seconds(8)).
 
 -record(state, {
     last_redirect_time :: undefined | non_neg_integer()
@@ -170,7 +170,7 @@ find_max_throughput_publisher() ->
         %% 全publisherの統計を取得
         AllStats = emqx_publisher_stats:get_publisher_stats(),
 
-        %% 直近60秒のpublish数（スループット）を計算
+        %% 直近10秒のpublish数（スループット）を計算
         %% タイムスタンプが秒単位かミリ秒単位かを自動判定して処理
         CurrentTime = erlang:system_time(second),
         RecentStats = [
@@ -179,10 +179,10 @@ find_max_throughput_publisher() ->
             case maps:get(timestamp, S, 0) of
                 Timestamp when Timestamp > 1000000000000 ->
                     %% ミリ秒単位（13桁以上）
-                    (Timestamp div 1000) >= (CurrentTime - 60);
-                Timestamp when Timestamp > 1000000000 ->
+                    (Timestamp div 1000) >= (CurrentTime - 10);
+                Timestamp when Timestamp > 1000000000000 ->
                     %% 秒単位（10桁）
-                    Timestamp >= (CurrentTime - 60);
+                    Timestamp >= (CurrentTime - 10);
                 _ ->
                     false
             end

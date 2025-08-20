@@ -1553,7 +1553,7 @@ fields("sysmon_os") ->
             sc(
                 duration(),
                 #{
-                    default => <<"60s">>,
+                    default => <<"10s">>,
                     desc => ?DESC(sysmon_os_cpu_check_interval)
                 }
             )},
