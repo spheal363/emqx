@@ -4,10 +4,10 @@ sysmon.os {
     ## Time interval for the periodic CPU check
     cpu_check_interval = 10s
 
-    ## CPU monitoring now uses dynamic threshold based on core count (cores * 0.6)
+    ## CPU monitoring now uses dynamic threshold based on core count (cores * 0.8)
     ## The old cpu_high_watermark and cpu_low_watermark settings are no longer used
     ## CPU usage is monitored using cpu_sup:avg1() which returns load average
-    ## Load average > (cores * 0.6) triggers high CPU usage alarm
+    ## Load average > (cores * 0.8) triggers high CPU usage alarm
     ## CPU check interval is now 10 seconds for more responsive monitoring
 
     ## Time interval for the periodic memory check

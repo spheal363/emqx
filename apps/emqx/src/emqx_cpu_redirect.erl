@@ -47,7 +47,7 @@
 ]).
 
 -define(SERVER, ?MODULE).
-% コア数×0.6の閾値（動的に計算）
+% コア数×0.8.の閾値（動的に計算）
 % 8秒のクールダウン
 -define(REDIRECT_COOLDOWN, timer:seconds(8)).
 
@@ -242,7 +242,7 @@ find_low_cpu_nodes() ->
                     {ok, RawLoadAvg} when is_number(RawLoadAvg) ->
                         %% 各ノードの実際のコア数を取得して閾値を計算
                         NodeCores = get_node_cores(Node),
-                        NodeThreshold = NodeCores * 0.6,
+                        NodeThreshold = NodeCores * 0.8,
                         %% emqx_vm:cpu_util()は256でスケーリングされたロードアベレージを返す
                         %% 256で割って実際のロードアベレージを取得
                         ActualLoadAvg = RawLoadAvg / 256.0,
@@ -441,7 +441,7 @@ get_node_info(Node) ->
             true ->
                 %% ローカルノードの場合
                 Cores = erlang:system_info(schedulers_online),
-                Threshold = Cores * 0.6,
+                Threshold = Cores * 0.8,
                 case emqx_vm:cpu_util() of
                     LoadAvg when is_number(LoadAvg) ->
                         {ok, #{
@@ -473,7 +473,7 @@ get_node_info(Node) ->
 get_local_node_info() ->
     try
         Cores = erlang:system_info(schedulers_online),
-        Threshold = Cores * 0.6,
+        Threshold = Cores * 0.8,
         case emqx_vm:cpu_util() of
             LoadAvg when is_number(LoadAvg) ->
                 {ok, #{

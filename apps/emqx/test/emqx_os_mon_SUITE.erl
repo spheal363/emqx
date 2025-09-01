@@ -184,7 +184,7 @@ t_cpu_check_alarm(_) ->
     LoadAvg = 2.5,
     %% コア数を取得して閾値を計算
     Cores = erlang:system_info(schedulers_online),
-    CPUThreshold = Cores * 0.6,
+    CPUThreshold = Cores * 0.8,
     emqx_common_test_helpers:with_mock(
         cpu_sup,
         avg1,
