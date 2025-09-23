@@ -136,7 +136,9 @@ t_should_redirect(_Config) ->
     ?assertNot(emqx_load_redirect:should_redirect(State2)),
 
     %% 30秒経過後はtrue
-    State3 = #emqx_load_redirect_state{last_redirect_time = erlang:system_time(millisecond) - 31000},
+    State3 = #emqx_load_redirect_state{
+        last_redirect_time = erlang:system_time(millisecond) - 31000
+    },
     ?assert(emqx_load_redirect:should_redirect(State3)).
 
 t_maybe_redirect_publisher(_Config) ->
