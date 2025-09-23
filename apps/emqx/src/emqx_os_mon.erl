@@ -183,7 +183,7 @@ handle_info({timeout, _Timer, cpu_check}, State) ->
                                 threshold => CPUThreshold,
                                 cores => Cores
                             }),
-                            emqx_cpu_redirect:maybe_redirect_publisher();
+                            emqx_load_redirect:maybe_redirect_publisher();
                         {error, already_existed} ->
                             %% アラームが既に存在する場合、DISCONNECT処理のみ実行
                             ?SLOG(info, #{
@@ -192,7 +192,7 @@ handle_info({timeout, _Timer, cpu_check}, State) ->
                                 threshold => CPUThreshold,
                                 cores => Cores
                             }),
-                            emqx_cpu_redirect:maybe_redirect_publisher();
+                            emqx_load_redirect:maybe_redirect_publisher();
                         Error ->
                             ?SLOG(error, #{
                                 msg => "failed_to_activate_cpu_alarm",
