@@ -14,7 +14,7 @@
 %% limitations under the License.
 %%--------------------------------------------------------------------
 
--module(emqx_cpu_redirect).
+-module(emqx_load_redirect).
 
 -behaviour(gen_server).
 
@@ -27,8 +27,8 @@
     stop/0,
     maybe_redirect_publisher/0,
     find_max_throughput_publisher/0,
-    find_low_cpu_nodes/0,
-    get_node_cpu_util/1,
+    find_low_load_nodes/0,
+    get_node_load_util/1,
     format_server_references/1,
     node_to_address/1,
     disconnect_publisher/2,
@@ -47,7 +47,7 @@
 ]).
 
 -define(SERVER, ?MODULE).
-% コア数×0.8.の閾値（動的に計算）
+% コア数×0.8の閾値（動的に計算）
 % 8秒のクールダウン
 -define(REDIRECT_COOLDOWN, timer:seconds(8)).
 
@@ -67,7 +67,7 @@ start_link() ->
 stop() ->
     gen_server:call(?SERVER, stop, infinity).
 
-%% @doc CPU使用率が高い場合にpublisherをリダイレクト
+%% @doc ロードアベレージが高い場合にpublisherをリダイレクト
 -spec maybe_redirect_publisher() -> ok.
 maybe_redirect_publisher() ->
     gen_server:cast(?SERVER, maybe_redirect_publisher).
@@ -90,18 +90,18 @@ handle_cast(maybe_redirect_publisher, State) ->
         true ->
             case find_max_throughput_publisher() of
                 {ok, ClientId, Throughput} ->
-                    case find_low_cpu_nodes() of
+                    case find_low_load_nodes() of
                         [] ->
                             %% 他のノードの情報も取得してログに含める
                             OtherNodesInfo = get_other_nodes_info(),
                             ?SLOG(warning, #{
-                                msg => "no_low_cpu_nodes_available",
+                                msg => "no_low_load_nodes_available",
                                 client_id => ClientId,
                                 throughput => Throughput,
                                 other_nodes_info => OtherNodesInfo
                             });
-                        LowCpuNodes ->
-                            ServerReferences = format_server_references(LowCpuNodes),
+                        LowLoadNodes ->
+                            ServerReferences = format_server_references(LowLoadNodes),
                             case disconnect_publisher(ClientId, ServerReferences) of
                                 ok ->
                                     ?SLOG(info, #{
@@ -109,7 +109,7 @@ handle_cast(maybe_redirect_publisher, State) ->
                                         client_id => ClientId,
                                         throughput => Throughput,
                                         server_references => ServerReferences,
-                                        target_nodes => LowCpuNodes
+                                        target_nodes => LowLoadNodes
                                     });
                                 {error, Reason} ->
                                     ?SLOG(error, #{
@@ -224,42 +224,42 @@ find_max_throughput_publisher() ->
             {error, {E, R}}
     end.
 
-%% @doc CPU使用率が低いノードを特定
--spec find_low_cpu_nodes() -> [node()].
-find_low_cpu_nodes() ->
+%% @doc ロードアベレージが低いノードを特定
+-spec find_low_load_nodes() -> [node()].
+find_low_load_nodes() ->
     try
         Nodes = emqx:running_nodes(),
         %% 自身のノードを除外
         OtherNodes = lists:delete(node(), Nodes),
         ?SLOG(debug, #{
-            msg => "finding_low_cpu_nodes",
+            msg => "finding_low_load_nodes",
             total_nodes => Nodes,
             other_nodes => OtherNodes
         }),
-        LowCpuNodes = lists:filter(
+        LowLoadNodes = lists:filter(
             fun(Node) ->
-                case get_node_cpu_util(Node) of
+                case get_node_load_util(Node) of
                     {ok, RawLoadAvg} when is_number(RawLoadAvg) ->
                         %% 各ノードの実際のコア数を取得して閾値を計算
                         NodeCores = get_node_cores(Node),
                         NodeThreshold = NodeCores * 0.8,
-                        %% emqx_vm:cpu_util()は256でスケーリングされたロードアベレージを返す
+                        %% emqx_vm:avg1()は256でスケーリングされたロードアベレージを返す
                         %% 256で割って実際のロードアベレージを取得
                         ActualLoadAvg = RawLoadAvg / 256.0,
-                        IsLowCpu = ActualLoadAvg < NodeThreshold,
+                        IsLowLoad = ActualLoadAvg < NodeThreshold,
                         ?SLOG(debug, #{
-                            msg => "node_cpu_check",
+                            msg => "node_load_check",
                             node => Node,
                             raw_load_avg => RawLoadAvg,
                             actual_load_avg => ActualLoadAvg,
                             cores => NodeCores,
                             threshold => NodeThreshold,
-                            is_low_cpu => IsLowCpu
+                            is_low_load => IsLowLoad
                         }),
-                        IsLowCpu;
+                        IsLowLoad;
                     {error, Reason} ->
                         ?SLOG(debug, #{
-                            msg => "node_cpu_check_error",
+                            msg => "node_load_check_error",
                             node => Node,
                             error => Reason
                         }),
@@ -269,14 +269,14 @@ find_low_cpu_nodes() ->
             OtherNodes
         ),
         ?SLOG(debug, #{
-            msg => "low_cpu_nodes_result",
-            low_cpu_nodes => LowCpuNodes
+            msg => "low_load_nodes_result",
+            low_load_nodes => LowLoadNodes
         }),
-        LowCpuNodes
+        LowLoadNodes
     catch
         E:R:S ->
             ?SLOG(error, #{
-                msg => "error_finding_low_cpu_nodes",
+                msg => "error_finding_low_load_nodes",
                 error => E,
                 reason => R,
                 stacktrace => S
@@ -284,26 +284,26 @@ find_low_cpu_nodes() ->
             []
     end.
 
-%% @doc ノードのCPU使用率を取得
--spec get_node_cpu_util(node()) -> {ok, float()} | {error, term()}.
-get_node_cpu_util(Node) ->
+%% @doc ノードのロードアベレージを取得
+-spec get_node_load_util(node()) -> {ok, float()} | {error, term()}.
+get_node_load_util(Node) ->
     try
         case Node =:= node() of
             true ->
                 %% ローカルノードの場合
-                case emqx_vm:cpu_util() of
-                    CpuUtil when is_number(CpuUtil) ->
-                        {ok, CpuUtil};
+                case emqx_vm:avg1() of
+                    LoadAvg when is_number(LoadAvg) ->
+                        {ok, LoadAvg};
                     _ ->
-                        {error, cpu_util_not_available}
+                        {error, load_util_not_available}
                 end;
             false ->
                 %% リモートノードの場合
-                case erpc:call(Node, emqx_vm, cpu_util, [], 5000) of
-                    CpuUtil when is_number(CpuUtil) ->
-                        {ok, CpuUtil};
+                case erpc:call(Node, emqx_vm, avg1, [], 5000) of
+                    LoadAvg when is_number(LoadAvg) ->
+                        {ok, LoadAvg};
                     _ ->
-                        {error, cpu_util_not_available}
+                        {error, load_util_not_available}
                 end
         end
     catch
@@ -442,7 +442,7 @@ get_node_info(Node) ->
                 %% ローカルノードの場合
                 Cores = erlang:system_info(schedulers_online),
                 Threshold = Cores * 0.8,
-                case emqx_vm:cpu_util() of
+                case emqx_vm:avg1() of
                     LoadAvg when is_number(LoadAvg) ->
                         {ok, #{
                             node => Node,
@@ -474,7 +474,7 @@ get_local_node_info() ->
     try
         Cores = erlang:system_info(schedulers_online),
         Threshold = Cores * 0.8,
-        case emqx_vm:cpu_util() of
+        case emqx_vm:avg1() of
             LoadAvg when is_number(LoadAvg) ->
                 {ok, #{
                     node => node(),
