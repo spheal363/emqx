@@ -48,6 +48,8 @@
 
 -export([cpu_util/0, cpu_util/1]).
 
+-export([avg1/0, avg15/0]).
+
 -ifdef(TEST).
 -compile(export_all).
 -compile(nowarn_export_all).
