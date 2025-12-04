@@ -245,7 +245,7 @@ defmodule EMQXUmbrella.MixProject do
   def common_dep(:emqtt),
     do:
       {:emqtt,
-       github: "emqx/emqtt", tag: "1.13.6", override: true, system_env: maybe_no_quic_env()}
+       github: "emqx/emqtt", tag: "1.13.7", override: true, system_env: maybe_no_quic_env()}
 
   def common_dep(:typerefl),
     do: {:typerefl, github: "ieQu1/typerefl", tag: "0.9.1", override: true}
@@ -278,19 +278,21 @@ defmodule EMQXUmbrella.MixProject do
   def common_dep(:influxdb),
     do: {:influxdb, github: "emqx/influxdb-client-erl", tag: "1.1.13", override: true}
 
-  def common_dep(:wolff), do: {:wolff, "4.0.9"}
+  def common_dep(:wolff), do: {:wolff, "4.0.11"}
   def common_dep(:brod_gssapi), do: {:brod_gssapi, "0.1.3"}
 
   def common_dep(:kafka_protocol),
-    do: {:kafka_protocol, "4.2.3", override: true}
+    do: {:kafka_protocol, "4.2.8", override: true}
 
-  def common_dep(:brod), do: {:brod, "4.3.1"}
+  def common_dep(:brod), do: {:brod, "4.4.6"}
   ## TODO: remove `mix.exs` from `wolff` and remove this override
   ## TODO: remove `mix.exs` from `pulsar` and remove this override
   def common_dep(:snappyer), do: {:snappyer, "1.2.10", override: true}
-  def common_dep(:crc32cer), do: {:crc32cer, "0.1.12", override: true}
+  def common_dep(:crc32cer), do: {:crc32cer, "1.0.4", override: true}
   def common_dep(:jesse), do: {:jesse, github: "emqx/jesse", tag: "1.8.1.1"}
   def common_dep(:erlavro), do: {:erlavro, github: "emqx/erlavro", tag: "2.10.0", override: true}
+
+  def common_dep(:erlcloud), do: {:erlcloud, github: "emqx/erlcloud", tag: "3.8.3.0"}
 
   def common_dep(:unicode_util_compat),
     do: {:unicode_util_compat, "0.7.1", override: true}

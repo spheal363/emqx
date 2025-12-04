@@ -32,15 +32,21 @@ start(_StartType, _StartArgs) ->
         ok = init_conf()
     catch
         C:E:St ->
-            %% logger is not quite ready.
-            io:format(standard_error, "Failed to load config~n~p~n~p~n~p~n", [C, E, St]),
-            init:stop(1)
+            ?SLOG(error, #{
+                msg => "failed_to_load_config", error => C, reason => E, stacktrace => St
+            }),
+            exit_loop(1)
     end,
     ok = emqx_config_logger:refresh_config(),
     emqx_conf_sup:start_link().
 
 stop(_State) ->
     ok.
+
+exit_loop(ExitCode) ->
+    timer:sleep(100),
+    init:stop(ExitCode),
+    exit_loop(ExitCode).
 
 %% @doc emqx_conf relies on this flag to synchronize configuration between nodes.
 %% Therefore, we must clean up this flag when emqx application is restarted by mria.
@@ -84,14 +90,14 @@ get_override_config_file() ->
 -define(DATA_DIRS, ["authz", "certs"]).
 
 sync_data_from_node() ->
-    Dir = emqx:data_dir(),
-    TargetDirs = lists:filter(
-        fun(Type) -> filelib:is_dir(filename:join(Dir, Type)) end, ?DATA_DIRS
-    ),
+    DataDir = emqx:data_dir(),
     Name = "data.zip",
-    case zip:zip(Name, TargetDirs, [memory, {cwd, Dir}]) of
-        {ok, {Name, Bin}} -> {ok, Bin};
-        {error, Reason} -> {error, Reason}
+    Files = traverse_and_collect_files(DataDir),
+    case zip:zip(Name, Files, [memory, {cwd, DataDir}]) of
+        {ok, {Name, Bin}} ->
+            {ok, Bin};
+        {error, Reason} ->
+            {error, Reason}
     end.
 
 %% ------------------------------------------------------------------------------
@@ -326,4 +332,37 @@ has_deprecated_file(#{conf := Conf} = Info) ->
             %% The old version don't have emqx_config:has_deprecated_file/0
             %% Conf is not empty if deprecated file is found.
             Conf =/= #{}
+    end.
+
+traverse_and_collect_files(DataDir) ->
+    SubDirs = lists:map(fun(D) -> filename:join(DataDir, D) end, ?DATA_DIRS),
+    Prefix = ensure_trailing_slash(DataDir),
+    do_traverse_and_collect_files(SubDirs, Prefix, _Acc = []).
+
+do_traverse_and_collect_files([] = _SubDirs, _Prefix, Acc) ->
+    Acc;
+do_traverse_and_collect_files([SubDir | Rest], Prefix, Acc0) ->
+    %% This function already drops any non-regular file, including symlinks.
+    Acc = filelib:fold_files(
+        SubDir,
+        _Regex = "",
+        _Recursive = true,
+        fun(Path0, Acc) ->
+            Path = to_data_dir_relative_path(Path0, Prefix),
+            [Path | Acc]
+        end,
+        Acc0
+    ),
+    do_traverse_and_collect_files(Rest, Prefix, Acc).
+
+%% Note: `Prefix' must end in `/'.
+to_data_dir_relative_path(Path, Prefix) ->
+    lists:flatten(string:replace(Path, Prefix, "", leading)).
+
+ensure_trailing_slash(DataDir) ->
+    case lists:suffix("/", DataDir) of
+        true ->
+            DataDir;
+        false ->
+            DataDir ++ "/"
     end.

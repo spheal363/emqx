@@ -14,6 +14,8 @@
 
 -import(emqx_common_test_helpers, [on_exit/1]).
 
+-define(ON(NODE, BODY), erpc:call(NODE, fun() -> BODY end)).
+
 %%------------------------------------------------------------------------------
 %% CT boilerplate
 %%------------------------------------------------------------------------------
@@ -48,6 +50,8 @@ sparkplug_tests() ->
     [
         t_sparkplug_decode,
         t_sparkplug_encode,
+        t_sparkplug_decode_bytes,
+        t_sparkplug_encode_bytes,
         t_sparkplug_decode_encode_with_message_name,
         t_sparkplug_encode_float_to_uint64_key,
         t_decode_fail
@@ -815,6 +819,45 @@ t_external_registry_load_config(_Config) ->
     ?assertMatch([_], emqx_schema_registry_http_api_SUITE:find_external_registry_worker(Name3)),
     ?assertMatch([], emqx_schema_registry_http_api_SUITE:find_external_registry_worker(Name2)),
 
+    ?assertMatch([Name0], emqx_schema_registry_external:list()),
+
+    ok.
+
+%% Checks that we initialize external HTTP registries
+t_external_registry_load_config_on_startup(TCConfig) ->
+    Name = <<"will_be_loaded">>,
+    URL = <<"http://url:8081">>,
+    ExternalHTTPConfig = emqx_schema_registry_http_api_SUITE:confluent_schema_registry_with_basic_auth(
+        #{
+            <<"url">> => URL
+        }
+    ),
+    Config = #{
+        <<"schema_registry">> => #{
+            <<"external">> => #{
+                Name => ExternalHTTPConfig
+            }
+        }
+    },
+    AppSpecs = [
+        emqx_conf,
+        emqx_rule_engine,
+        {emqx_schema_registry, #{config => Config}}
+    ],
+    ClusterSpec = [{external_http_load1, #{apps => AppSpecs}}],
+    [N1] = emqx_cth_cluster:start(
+        ClusterSpec,
+        #{work_dir => emqx_cth_suite:work_dir(?FUNCTION_NAME, TCConfig)}
+    ),
+    on_exit(fun() -> emqx_cth_cluster:stop([N1]) end),
+    {ok, _} = ?block_until(
+        #{
+            ?snk_kind := "external_registries_loaded",
+            ?snk_meta := #{node := N1}
+        },
+        10_000
+    ),
+    ?assertMatch([Name], ?ON(N1, emqx_schema_registry_external:list())),
     ok.
 
 t_import_config(_Config) ->
@@ -981,6 +1024,91 @@ t_sparkplug_encode(_Config) ->
     emqx:publish(emqx_message:make(<<"t">>, PayloadJSONBin)),
     Res = receive_action_results(),
     ?assertMatch(#{data := ExpectedRuleOutput}, Res),
+    ok.
+
+%% Original issue: the input/output of `bytes` values were not base64 decoded/encoded,
+%% respectively, and thus were not following the Protobuf spec.
+%% See also: https://emqx.atlassian.net/browse/EMQX-14659
+t_sparkplug_decode_bytes(_TCConfig) ->
+    SQL =
+        <<
+            "select\n"
+            "  spb_decode(payload) as decoded\n"
+            "from t\n"
+        >>,
+    PayloadHex = <<
+        "08b0da90dd8e33122d0a04626c6f6218b0da90dd8e33201182011ba3ffa0ffa4"
+        "ffa3ffa6ff9dffa4ff9fffa2ff9cffa0ffa2ffa2ffa318a901"
+    >>,
+    {ok, _} = create_rule_http(#{sql => SQL}),
+    PayloadBin = binary:decode_hex(PayloadHex),
+    ExpectedRuleOutput =
+        #{
+            <<"decoded">> =>
+                #{
+                    <<"metrics">> =>
+                        [
+                            #{
+                                <<"bytes_value">> =>
+                                    <<"o/+g/6T/o/+m/53/pP+f/6L/nP+g/6L/ov+j">>,
+                                <<"datatype">> => 17,
+                                <<"name">> => <<"blob">>,
+                                <<"timestamp">> => 1756300062000
+                            }
+                        ],
+                    <<"seq">> => 169,
+                    <<"timestamp">> => 1756300062000
+                }
+        },
+    wait_for_sparkplug_schema_registered(),
+    emqx:publish(emqx_message:make(<<"t">>, PayloadBin)),
+    Res = receive_action_results(),
+    ?assertMatch(
+        #{data := ExpectedRuleOutput},
+        Res,
+        #{expected => ExpectedRuleOutput}
+    ),
+    ok.
+
+%% Original issue: the input/output of `bytes` values were not base64 decoded/encoded,
+%% respectively, and thus were not following the Protobuf spec.
+%% See also: https://emqx.atlassian.net/browse/EMQX-14659
+t_sparkplug_encode_bytes(_TCConfig) ->
+    SQL =
+        <<
+            "select\n"
+            "  spb_encode(json_decode(payload)) as encoded\n"
+            "from t\n"
+        >>,
+    {ok, _} = create_rule_http(#{sql => SQL}),
+    Payload = #{
+        <<"metrics">> =>
+            [
+                #{
+                    <<"bytes_value">> =>
+                        <<"o/+g/6T/o/+m/53/pP+f/6L/nP+g/6L/ov+j">>,
+                    <<"datatype">> => 17,
+                    <<"name">> => <<"blob">>,
+                    <<"timestamp">> => 1756300062000
+                }
+            ],
+        <<"seq">> => 169,
+        <<"timestamp">> => 1756300062000
+    },
+    PayloadBin = emqx_utils_json:encode(Payload),
+    ResultHex = <<
+        "08b0da90dd8e33122d0a04626c6f6218b0da90dd8e33201182011ba3ffa0ffa4"
+        "ffa3ffa6ff9dffa4ff9fffa2ff9cffa0ffa2ffa2ffa318a901"
+    >>,
+    ExpectedRuleOutput = #{<<"encoded">> => binary:decode_hex(ResultHex)},
+    wait_for_sparkplug_schema_registered(),
+    emqx:publish(emqx_message:make(<<"t">>, PayloadBin)),
+    Res = receive_action_results(),
+    ?assertMatch(
+        #{data := ExpectedRuleOutput},
+        Res,
+        #{expected => ExpectedRuleOutput}
+    ),
     ok.
 
 t_sparkplug_encode_float_to_uint64_key(_Config) ->

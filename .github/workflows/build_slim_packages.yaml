@@ -27,7 +27,7 @@ jobs:
       fail-fast: false
       matrix:
         profile:
-          - ["emqx", "elixir", "amd64"]
+          - ["emqx", "erlang", "amd64"]
           - ["emqx", "elixir", "arm64"]
           - ["emqx-enterprise", "erlang", "amd64"]
 
@@ -55,7 +55,7 @@ jobs:
         profile:
         - emqx
         os:
-        - macos-14-arm64
+        - macos-14
 
     runs-on: ${{ matrix.os }}
     env:
