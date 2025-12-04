@@ -95,7 +95,12 @@ handle_continue(setup, undefined) ->
     CpuRef = start_cpu_check_timer(),
     %% the value of the first call should be regarded as garbage.
     _Val = cpu_sup:util(),
-    {noreply, #{sysmem_high_watermark => SysHW, mem_time_ref => MemRef, cpu_time_ref => CpuRef}}.
+    {noreply, #{
+        sysmem_high_watermark => SysHW,
+        mem_time_ref => MemRef,
+        cpu_time_ref => CpuRef,
+        consecutive_high_cpu_count => 0
+    }}.
 
 init_os_monitor() ->
     init_os_monitor(emqx:get_config([sysmon, os])).
@@ -124,7 +129,13 @@ handle_cast({monitor_conf_update, OS}, State) ->
     SysHW = init_os_monitor(OS),
     MemRef = start_mem_check_timer(),
     CpuRef = start_cpu_check_timer(),
-    {noreply, #{sysmem_high_watermark => SysHW, mem_time_ref => MemRef, cpu_time_ref => CpuRef}};
+    {noreply,
+        maps:merge(State, #{
+            sysmem_high_watermark => SysHW,
+            mem_time_ref => MemRef,
+            cpu_time_ref => CpuRef,
+            consecutive_high_cpu_count => 0
+        })};
 handle_cast(Msg, State) ->
     ?SLOG(error, #{msg => "unexpected_cast", cast => Msg}),
     {noreply, State}.
@@ -144,28 +155,96 @@ handle_info({timeout, _Timer, cpu_check}, State) ->
             Val when is_number(Val) -> Val / 256.0;
             _ -> RawLoadAvg
         end,
-    case LoadAvg of
-        %% 0 or 0.0
-        Load when Load == 0 ->
-            %% ロードが0の場合はアラームを非アクティブ化
-            ok = emqx_alarm:ensure_deactivated(
-                high_cpu_usage,
-                #{
-                    load_avg => Load,
-                    threshold => CPUThreshold,
-                    cores => Cores
-                },
-                usage_msg(Load, cpu)
-            );
-        Load when is_number(Load) ->
-            %% ロードアベレージをCPU使用率のパーセンテージに変換
-            %% ロードアベレージがコア数に近い場合、CPU使用率は高い
-            %% ロードアベレージがコア数の80%を超えた場合、CPU使用率が高いと判断
-            if
-                Load > CPUThreshold ->
-                    %% CPU使用率が閾値を超えた場合、アラームをアクティブ化
-                    case
-                        emqx_alarm:activate(
+    %% 連続で閾値を超えた回数を取得（デフォルトは0）
+    ConsecutiveCount = maps:get(consecutive_high_cpu_count, State, 0),
+    {_NewConsecutiveCount, NewState} =
+        case LoadAvg of
+            %% 0 or 0.0
+            Load when Load == 0 ->
+                %% ロードが0の場合はアラームを非アクティブ化し、カウントをリセット
+                ok = emqx_alarm:ensure_deactivated(
+                    high_cpu_usage,
+                    #{
+                        load_avg => Load,
+                        threshold => CPUThreshold,
+                        cores => Cores
+                    },
+                    usage_msg(Load, cpu)
+                ),
+                {0, State#{consecutive_high_cpu_count => 0}};
+            Load when is_number(Load) ->
+                %% ロードアベレージをCPU使用率のパーセンテージに変換
+                %% ロードアベレージがコア数に近い場合、CPU使用率は高い
+                %% ロードアベレージがコア数の80%を超えた場合、CPU使用率が高いと判断
+                if
+                    Load > CPUThreshold ->
+                        %% CPU使用率が閾値を超えた場合、連続カウントをインクリメント
+                        NewCount = ConsecutiveCount + 1,
+                        ?SLOG(debug, #{
+                            msg => "cpu_threshold_exceeded",
+                            load_avg => Load,
+                            threshold => CPUThreshold,
+                            cores => Cores,
+                            consecutive_count => NewCount
+                        }),
+                        %% アラームをアクティブ化
+                        case
+                            emqx_alarm:activate(
+                                high_cpu_usage,
+                                #{
+                                    load_avg => Load,
+                                    threshold => CPUThreshold,
+                                    cores => Cores,
+                                    consecutive_count => NewCount
+                                },
+                                usage_msg(Load, cpu)
+                            )
+                        of
+                            ok ->
+                                %% 新しいアラームが作成された場合
+                                ?SLOG(warning, #{
+                                    msg => "cpu_alarm_activated",
+                                    load_avg => Load,
+                                    threshold => CPUThreshold,
+                                    cores => Cores,
+                                    consecutive_count => NewCount
+                                });
+                            {error, already_existed} ->
+                                %% アラームが既に存在する場合
+                                ?SLOG(info, #{
+                                    msg => "cpu_alarm_already_active",
+                                    load_avg => Load,
+                                    threshold => CPUThreshold,
+                                    cores => Cores,
+                                    consecutive_count => NewCount
+                                });
+                            Error ->
+                                ?SLOG(error, #{
+                                    msg => "failed_to_activate_cpu_alarm",
+                                    error => Error,
+                                    load_avg => Load,
+                                    threshold => CPUThreshold
+                                })
+                        end,
+                        %% 2回連続で閾値を超えた場合のみリダイレクトを実行
+                        case NewCount >= 2 of
+                            true ->
+                                ?SLOG(warning, #{
+                                    msg => "cpu_consecutive_threshold_exceeded",
+                                    load_avg => Load,
+                                    threshold => CPUThreshold,
+                                    consecutive_count => NewCount,
+                                    action => "redirecting_publisher"
+                                }),
+                                emqx_load_redirect:maybe_redirect_publisher(),
+                                %% リダイレクト後はカウントをリセット（クールダウン）
+                                {0, State#{consecutive_high_cpu_count => 0}};
+                            false ->
+                                {NewCount, State#{consecutive_high_cpu_count => NewCount}}
+                        end;
+                    true ->
+                        %% ロードアベレージが閾値以下の場合、アラームを非アクティブ化し、カウントをリセット
+                        ok = emqx_alarm:ensure_deactivated(
                             high_cpu_usage,
                             #{
                                 load_avg => Load,
@@ -173,62 +252,26 @@ handle_info({timeout, _Timer, cpu_check}, State) ->
                                 cores => Cores
                             },
                             usage_msg(Load, cpu)
-                        )
-                    of
-                        ok ->
-                            %% 新しいアラームが作成された場合、DISCONNECT処理を実行
-                            ?SLOG(warning, #{
-                                msg => "cpu_alarm_activated",
-                                load_avg => Load,
-                                threshold => CPUThreshold,
-                                cores => Cores
-                            }),
-                            emqx_load_redirect:maybe_redirect_publisher();
-                        {error, already_existed} ->
-                            %% アラームが既に存在する場合、DISCONNECT処理のみ実行
-                            ?SLOG(info, #{
-                                msg => "cpu_alarm_already_active",
-                                load_avg => Load,
-                                threshold => CPUThreshold,
-                                cores => Cores
-                            }),
-                            emqx_load_redirect:maybe_redirect_publisher();
-                        Error ->
-                            ?SLOG(error, #{
-                                msg => "failed_to_activate_cpu_alarm",
-                                error => Error,
-                                load_avg => Load,
-                                threshold => CPUThreshold
-                            })
-                    end;
-                true ->
-                    %% ロードアベレージが閾値以下の場合、アラームを非アクティブ化
-                    ok = emqx_alarm:ensure_deactivated(
-                        high_cpu_usage,
-                        #{
+                        ),
+                        ?SLOG(info, #{
+                            msg => "cpu_alarm_deactivated",
                             load_avg => Load,
                             threshold => CPUThreshold,
                             cores => Cores
-                        },
-                        usage_msg(Load, cpu)
-                    ),
-                    ?SLOG(info, #{
-                        msg => "cpu_alarm_deactivated",
-                        load_avg => Load,
-                        threshold => CPUThreshold,
-                        cores => Cores
-                    })
-            end;
-        LoadError ->
-            %% {error, timeout} ...
-            ?SLOG(warning, #{
-                msg => "cpu_monitor_timeout",
-                load_avg => LoadError
-            }),
-            ok
-    end,
+                        }),
+                        {0, State#{consecutive_high_cpu_count => 0}}
+                end;
+            LoadError ->
+                %% {error, timeout} ...
+                ?SLOG(warning, #{
+                    msg => "cpu_monitor_timeout",
+                    load_avg => LoadError
+                }),
+                %% エラー時はカウントをリセット
+                {0, State#{consecutive_high_cpu_count => 0}}
+        end,
     Ref = start_cpu_check_timer(),
-    {noreply, State#{cpu_time_ref => Ref}};
+    {noreply, NewState#{cpu_time_ref => Ref}};
 handle_info(Info, State) ->
     ?SLOG(error, #{msg => "unexpected_info", info => Info}),
     {noreply, State}.
@@ -242,7 +285,9 @@ code_change(_OldVsn, State, _Extra) ->
 %%--------------------------------------------------------------------
 %% Internal functions
 %%--------------------------------------------------------------------
-cancel_outdated_timer(#{mem_time_ref := MemRef, cpu_time_ref := CpuRef}) ->
+cancel_outdated_timer(State) ->
+    MemRef = maps:get(mem_time_ref, State, undefined),
+    CpuRef = maps:get(cpu_time_ref, State, undefined),
     emqx_utils:cancel_timer(MemRef),
     emqx_utils:cancel_timer(CpuRef),
     ok.
