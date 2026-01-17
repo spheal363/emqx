@@ -99,7 +99,10 @@ handle_continue(setup, undefined) ->
         sysmem_high_watermark => SysHW,
         mem_time_ref => MemRef,
         cpu_time_ref => CpuRef,
-        consecutive_high_cpu_count => 0
+        consecutive_high_cpu_count => 0,
+        consecutive_high_steal_count => 0,
+        prev_steal_total => undefined,
+        prev_idle_total => undefined
     }}.
 
 init_os_monitor() ->
@@ -134,7 +137,10 @@ handle_cast({monitor_conf_update, OS}, State) ->
             sysmem_high_watermark => SysHW,
             mem_time_ref => MemRef,
             cpu_time_ref => CpuRef,
-            consecutive_high_cpu_count => 0
+            consecutive_high_cpu_count => 0,
+            consecutive_high_steal_count => 0,
+            prev_steal_total => undefined,
+            prev_idle_total => undefined
         })};
 handle_cast(Msg, State) ->
     ?SLOG(error, #{msg => "unexpected_cast", cast => Msg}),
@@ -156,8 +162,14 @@ handle_info({timeout, _Timer, cpu_check}, State) ->
             _ -> RawLoadAvg
         end,
     %% 連続で閾値を超えた回数を取得（デフォルトは0）
-    ConsecutiveCount = maps:get(consecutive_high_cpu_count, State, 0),
-    {_NewConsecutiveCount, NewState} =
+    ConsecutiveLoadCount = maps:get(consecutive_high_cpu_count, State, 0),
+    ConsecutiveStealCount = maps:get(consecutive_high_steal_count, State, 0),
+    %% steal値を取得（Linuxの場合のみ）
+    {StealPercent, StateWithSteal} = get_cpu_steal_percent(State),
+    %% steal閾値は30%
+    StealThreshold = 30.0,
+    %% ロードアベレージのチェック
+    {NewLoadCount, StateAfterLoad} =
         case LoadAvg of
             %% 0 or 0.0
             Load when Load == 0 ->
@@ -171,7 +183,7 @@ handle_info({timeout, _Timer, cpu_check}, State) ->
                     },
                     usage_msg(Load, cpu)
                 ),
-                {0, State#{consecutive_high_cpu_count => 0}};
+                {0, StateWithSteal#{consecutive_high_cpu_count => 0}};
             Load when is_number(Load) ->
                 %% ロードアベレージをCPU使用率のパーセンテージに変換
                 %% ロードアベレージがコア数に近い場合、CPU使用率は高い
@@ -179,7 +191,7 @@ handle_info({timeout, _Timer, cpu_check}, State) ->
                 if
                     Load > CPUThreshold ->
                         %% CPU使用率が閾値を超えた場合、連続カウントをインクリメント
-                        NewCount = ConsecutiveCount + 1,
+                        NewCount = ConsecutiveLoadCount + 1,
                         ?SLOG(debug, #{
                             msg => "cpu_threshold_exceeded",
                             load_avg => Load,
@@ -226,22 +238,7 @@ handle_info({timeout, _Timer, cpu_check}, State) ->
                                     threshold => CPUThreshold
                                 })
                         end,
-                        %% 2回連続で閾値を超えた場合のみリダイレクトを実行
-                        case NewCount >= 2 of
-                            true ->
-                                ?SLOG(warning, #{
-                                    msg => "cpu_consecutive_threshold_exceeded",
-                                    load_avg => Load,
-                                    threshold => CPUThreshold,
-                                    consecutive_count => NewCount,
-                                    action => "redirecting_publisher"
-                                }),
-                                emqx_load_redirect:maybe_redirect_publisher(),
-                                %% リダイレクト後はカウントをリセット（クールダウン）
-                                {0, State#{consecutive_high_cpu_count => 0}};
-                            false ->
-                                {NewCount, State#{consecutive_high_cpu_count => NewCount}}
-                        end;
+                        {NewCount, StateWithSteal#{consecutive_high_cpu_count => NewCount}};
                     true ->
                         %% ロードアベレージが閾値以下の場合、アラームを非アクティブ化し、カウントをリセット
                         ok = emqx_alarm:ensure_deactivated(
@@ -259,7 +256,7 @@ handle_info({timeout, _Timer, cpu_check}, State) ->
                             threshold => CPUThreshold,
                             cores => Cores
                         }),
-                        {0, State#{consecutive_high_cpu_count => 0}}
+                        {0, StateWithSteal#{consecutive_high_cpu_count => 0}}
                 end;
             LoadError ->
                 %% {error, timeout} ...
@@ -268,10 +265,79 @@ handle_info({timeout, _Timer, cpu_check}, State) ->
                     load_avg => LoadError
                 }),
                 %% エラー時はカウントをリセット
-                {0, State#{consecutive_high_cpu_count => 0}}
+                {0, StateWithSteal#{consecutive_high_cpu_count => 0}}
+        end,
+    %% steal値のチェック
+    {NewStealCount, NewState} =
+        case StealPercent of
+            Steal when is_number(Steal), Steal >= 0 ->
+                %% デバッグ用：steal値をログ出力
+                ?SLOG(debug, #{
+                    msg => "steal_value_monitored",
+                    steal_percent => Steal,
+                    threshold => StealThreshold,
+                    consecutive_count => ConsecutiveStealCount
+                }),
+                if
+                    Steal >= StealThreshold ->
+                        %% stealが閾値を超えた場合、連続カウントをインクリメント
+                        NewStealCount0 = ConsecutiveStealCount + 1,
+                        ?SLOG(warning, #{
+                            msg => "steal_threshold_exceeded",
+                            steal_percent => Steal,
+                            threshold => StealThreshold,
+                            consecutive_count => NewStealCount0
+                        }),
+                        {NewStealCount0, StateAfterLoad#{
+                            consecutive_high_steal_count => NewStealCount0
+                        }};
+                    true ->
+                        %% stealが閾値以下の場合、カウントをリセット
+                        {0, StateAfterLoad#{consecutive_high_steal_count => 0}}
+                end;
+            _ ->
+                %% steal値が取得できない場合、初回のみ警告ログを出力
+                case maps:get(prev_steal_total, State, undefined) of
+                    undefined ->
+                        ?SLOG(debug, #{
+                            msg => "steal_percent_not_available",
+                            reason => "initializing_or_not_supported"
+                        });
+                    _ ->
+                        ?SLOG(debug, #{
+                            msg => "steal_percent_not_available",
+                            reason => "failed_to_get_steal_value"
+                        })
+                end,
+                %% steal値が取得できない場合、カウントはリセットしない（前回の値を維持）
+                {ConsecutiveStealCount, StateAfterLoad}
+        end,
+    %% ロードアベレージまたはstealのどちらかが2回連続で閾値を超えた場合にリダイレクト
+    ShouldRedirect = (NewLoadCount >= 2) orelse (NewStealCount >= 2),
+    FinalState =
+        case ShouldRedirect of
+            true ->
+                ?SLOG(warning, #{
+                    msg => "redirect_condition_met",
+                    load_avg => LoadAvg,
+                    load_threshold => CPUThreshold,
+                    load_consecutive_count => NewLoadCount,
+                    steal_percent => StealPercent,
+                    steal_threshold => StealThreshold,
+                    steal_consecutive_count => NewStealCount,
+                    action => "redirecting_publisher"
+                }),
+                emqx_load_redirect:maybe_redirect_publisher(),
+                %% リダイレクト後はカウントをリセット（クールダウン）
+                NewState#{
+                    consecutive_high_cpu_count => 0,
+                    consecutive_high_steal_count => 0
+                };
+            false ->
+                NewState
         end,
     Ref = start_cpu_check_timer(),
-    {noreply, NewState#{cpu_time_ref => Ref}};
+    {noreply, FinalState#{cpu_time_ref => Ref}};
 handle_info(Info, State) ->
     ?SLOG(error, #{msg => "unexpected_info", info => Info}),
     {noreply, State}.
@@ -369,3 +435,134 @@ usage_msg(Usage, What) ->
 update_memory_protect_threshold(New) ->
     LCConfig = load_ctl:get_config(),
     load_ctl:put_config(LCConfig#{memory_threshold := New}).
+
+%% @doc CPU steal値を取得（パーセンテージと更新されたState）
+%% /proc/statからsteal値を読み取り、前回の値との差分から%を計算
+%% Linuxでのみ動作する
+-spec get_cpu_steal_percent(map()) -> {float() | undefined, map()}.
+get_cpu_steal_percent(State) ->
+    case is_os_check_supported() of
+        true ->
+            get_cpu_steal_percent_linux(State);
+        false ->
+            {undefined, State}
+    end.
+
+%% @doc LinuxでCPU steal値を取得
+-spec get_cpu_steal_percent_linux(map()) -> {float() | undefined, map()}.
+get_cpu_steal_percent_linux(State) ->
+    try
+        %% /proc/statからcpu行を読み取る
+        case file:read_file("/proc/stat") of
+            {ok, Content} ->
+                Lines = binary:split(Content, <<"\n">>, [global]),
+                %% "cpu "で始まる行を探す（全CPUの合計）
+                CpuLine = find_cpu_line(Lines),
+                case parse_cpu_line(CpuLine) of
+                    {ok, Idle, Steal, Total} ->
+                        %% 前回の値を取得
+                        PrevIdle = maps:get(prev_idle_total, State, undefined),
+                        PrevSteal = maps:get(prev_steal_total, State, undefined),
+                        PrevTotal = maps:get(prev_total, State, undefined),
+                        %% Stateを更新（新しい値を保存）
+                        NewState = State#{
+                            prev_idle_total => Idle,
+                            prev_steal_total => Steal,
+                            prev_total => Total
+                        },
+                        case {PrevIdle, PrevSteal, PrevTotal} of
+                            {undefined, undefined, undefined} ->
+                                %% 初回の場合は値を保存するだけで0を返す
+                                {0.0, NewState};
+                            {PrevIdle, PrevSteal, PrevTotal} when
+                                is_integer(PrevIdle), is_integer(PrevSteal), is_integer(PrevTotal)
+                            ->
+                                %% 差分を計算
+                                StealDiff = Steal - PrevSteal,
+                                TotalDiff = Total - PrevTotal,
+                                if
+                                    TotalDiff > 0 ->
+                                        %% stealの割合を計算（パーセンテージ）
+                                        StealPercent = (StealDiff / TotalDiff) * 100.0,
+                                        {StealPercent, NewState};
+                                    true ->
+                                        %% TotalDiffが0以下の場合は0を返す
+                                        {0.0, NewState}
+                                end;
+                            _ ->
+                                {undefined, NewState}
+                        end;
+                    {error, Reason} ->
+                        ?SLOG(debug, #{
+                            msg => "failed_to_parse_cpu_stat",
+                            error => Reason
+                        }),
+                        {undefined, State}
+                end;
+            {error, Reason} ->
+                ?SLOG(debug, #{
+                    msg => "failed_to_read_proc_stat",
+                    error => Reason
+                }),
+                {undefined, State}
+        end
+    catch
+        E:R:S ->
+            ?SLOG(error, #{
+                msg => "error_getting_cpu_steal",
+                error => E,
+                reason => R,
+                stacktrace => S
+            }),
+            {undefined, State}
+    end.
+
+%% @doc /proc/statの行から"cpu "で始まる行を探す
+-spec find_cpu_line([binary()]) -> binary() | undefined.
+find_cpu_line([]) ->
+    undefined;
+find_cpu_line([Line | Rest]) ->
+    case binary:match(Line, <<"cpu ">>) of
+        {0, _} ->
+            %% "cpu "で始まる行が見つかった
+            Line;
+        _ ->
+            find_cpu_line(Rest)
+    end.
+
+%% @doc /proc/statのcpu行をパース
+%% フォーマット: cpu  user nice system idle iowait irq softirq steal guest guest_nice
+%% インデックス:    0    1     2       3     4        5    6        7      8      9
+-spec parse_cpu_line(binary() | undefined) ->
+    {ok, integer(), integer(), integer()} | {error, term()}.
+parse_cpu_line(undefined) ->
+    {error, cpu_line_not_found};
+parse_cpu_line(Line) ->
+    try
+        %% 空白で分割（空の要素を除外）
+        Parts0 = binary:split(Line, <<" ">>, [global, trim]),
+        %% 空のバイナリ要素をフィルタリング
+        Parts = [P || P <- Parts0, byte_size(P) > 0],
+        case Parts of
+            [<<"cpu">>, User, Nice, System, Idle, IoWait, Irq, SoftIrq, Steal | _Rest] ->
+                %% 値を整数に変換
+                UserVal = binary_to_integer(User),
+                NiceVal = binary_to_integer(Nice),
+                SystemVal = binary_to_integer(System),
+                IdleVal = binary_to_integer(Idle),
+                IoWaitVal = binary_to_integer(IoWait),
+                IrqVal = binary_to_integer(Irq),
+                SoftIrqVal = binary_to_integer(SoftIrq),
+                StealVal = binary_to_integer(Steal),
+                %% 合計を計算
+                Total =
+                    UserVal + NiceVal + SystemVal + IdleVal + IoWaitVal + IrqVal + SoftIrqVal +
+                        StealVal,
+                {ok, IdleVal, StealVal, Total};
+            _ ->
+                {error, invalid_format}
+        end
+    catch
+        E:R ->
+            {error, {E, R}}
+    end.
