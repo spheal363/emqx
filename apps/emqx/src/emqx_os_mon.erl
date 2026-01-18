@@ -167,7 +167,7 @@ handle_info({timeout, _Timer, cpu_check}, State) ->
     %% steal値を取得（Linuxの場合のみ）
     {StealPercent, StateWithSteal} = get_cpu_steal_percent(State),
     %% steal閾値は30%
-    StealThreshold = 30.0,
+    StealThreshold = 10.0,
     %% ロードアベレージのチェック
     {NewLoadCount, StateAfterLoad} =
         case LoadAvg of
