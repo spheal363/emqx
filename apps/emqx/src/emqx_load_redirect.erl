@@ -77,6 +77,8 @@ maybe_redirect_publisher() ->
 %%--------------------------------------------------------------------
 
 init([]) ->
+    %% CSVファイルを初期化（存在しない場合はヘッダー付きで作成）
+    init_csv_file(),
     {ok, #state{last_redirect_time = undefined}}.
 
 handle_call(stop, _From, State) ->
@@ -86,11 +88,25 @@ handle_call(Req, _From, State) ->
     {reply, ignored, State}.
 
 handle_cast(maybe_redirect_publisher, State) ->
+    %% 処理開始時刻を記録
+    StartTimestamp = erlang:system_time(millisecond),
+    StartTime = erlang:monotonic_time(millisecond),
+
     case should_redirect(State) of
         true ->
-            case find_max_throughput_publisher() of
+            %% ①パブリッシャの統計収集→最大スループットパブリッシャ取得
+            Step1Start = erlang:monotonic_time(millisecond),
+            Step1Result = find_max_throughput_publisher(),
+            Step1Duration = erlang:monotonic_time(millisecond) - Step1Start,
+
+            case Step1Result of
                 {ok, ClientId, Throughput} ->
-                    case find_low_load_nodes() of
+                    %% ②クラスタ内の他の全てのブローカにロードアベレージを問い合わせ
+                    Step2Start = erlang:monotonic_time(millisecond),
+                    Step2Result = find_low_load_nodes(),
+                    Step2Duration = erlang:monotonic_time(millisecond) - Step2Start,
+
+                    case Step2Result of
                         [] ->
                             %% 他のノードの情報も取得してログに含める
                             OtherNodesInfo = get_other_nodes_info(),
@@ -99,10 +115,27 @@ handle_cast(maybe_redirect_publisher, State) ->
                                 client_id => ClientId,
                                 throughput => Throughput,
                                 other_nodes_info => OtherNodesInfo
-                            });
+                            }),
+                            %% CSVに記録（低負荷ノードが見つからなかった場合）
+                            EndTimestamp = erlang:system_time(millisecond),
+                            EndTime = erlang:monotonic_time(millisecond),
+                            TotalDuration = EndTime - StartTime,
+                            record_process_times(
+                                StartTimestamp,
+                                Step1Duration,
+                                Step2Duration,
+                                0,
+                                EndTimestamp,
+                                TotalDuration
+                            );
                         LowLoadNodes ->
+                            %% ③低負荷ブローカのアドレスをServer Referenceに追加→DISCONNECT
+                            Step3Start = erlang:monotonic_time(millisecond),
                             ServerReferences = format_server_references(LowLoadNodes),
-                            case disconnect_publisher(ClientId, ServerReferences) of
+                            Step3Result = disconnect_publisher(ClientId, ServerReferences),
+                            Step3Duration = erlang:monotonic_time(millisecond) - Step3Start,
+
+                            case Step3Result of
                                 ok ->
                                     ?SLOG(info, #{
                                         msg => "publisher_redirected",
@@ -117,13 +150,32 @@ handle_cast(maybe_redirect_publisher, State) ->
                                         client_id => ClientId,
                                         reason => Reason
                                     })
-                            end
+                            end,
+                            %% CSVに記録
+                            EndTimestamp = erlang:system_time(millisecond),
+                            EndTime = erlang:monotonic_time(millisecond),
+                            TotalDuration = EndTime - StartTime,
+                            record_process_times(
+                                StartTimestamp,
+                                Step1Duration,
+                                Step2Duration,
+                                Step3Duration,
+                                EndTimestamp,
+                                TotalDuration
+                            )
                     end;
                 {error, Reason} ->
                     ?SLOG(warning, #{
                         msg => "no_publishers_found",
                         reason => Reason
-                    })
+                    }),
+                    %% CSVに記録（パブリッシャが見つからなかった場合）
+                    EndTimestamp = erlang:system_time(millisecond),
+                    EndTime = erlang:monotonic_time(millisecond),
+                    TotalDuration = EndTime - StartTime,
+                    record_process_times(
+                        StartTimestamp, Step1Duration, 0, 0, EndTimestamp, TotalDuration
+                    )
             end,
             {noreply, State#state{last_redirect_time = erlang:system_time(millisecond)}};
         false ->
@@ -489,3 +541,102 @@ get_local_node_info() ->
         E:R ->
             {error, {E, R}}
     end.
+
+%% @doc CSVファイルを初期化（存在しない場合はヘッダー付きで作成）
+-spec init_csv_file() -> ok.
+init_csv_file() ->
+    try
+        FilePath = "/home/sdoi/process_time.csv",
+        case filelib:is_file(FilePath) of
+            false ->
+                %% ファイルが存在しない場合はヘッダー付きで作成
+                Header =
+                    "start_timestamp,step1_duration_ms,step2_duration_ms,step3_duration_ms,end_timestamp,total_duration_ms\n",
+                ok = file:write_file(FilePath, Header),
+                ?SLOG(info, #{
+                    msg => "csv_file_initialized",
+                    file_path => FilePath
+                });
+            true ->
+                %% ファイルが既に存在する場合は何もしない
+                ok
+        end
+    catch
+        E:R:S ->
+            ?SLOG(error, #{
+                msg => "error_initializing_csv_file",
+                error => E,
+                reason => R,
+                stacktrace => S
+            })
+    end.
+
+%% @doc 処理時間をCSVファイルに記録
+-spec record_process_times(
+    StartTimestamp :: non_neg_integer(),
+    Step1Duration :: non_neg_integer(),
+    Step2Duration :: non_neg_integer(),
+    Step3Duration :: non_neg_integer(),
+    EndTimestamp :: non_neg_integer(),
+    TotalDuration :: non_neg_integer()
+) -> ok.
+record_process_times(
+    StartTimestamp, Step1Duration, Step2Duration, Step3Duration, EndTimestamp, TotalDuration
+) ->
+    try
+        %% CSVファイルパス
+        FilePath = "/home/sdoi/process_time.csv",
+
+        %% タイムスタンプをISO 8601形式に変換（文字列に変換）
+        StartISO = lists:flatten(format_timestamp(StartTimestamp)),
+        EndISO = lists:flatten(format_timestamp(EndTimestamp)),
+
+        %% CSV行を構築
+        %% カラム: start_timestamp, step1_duration_ms, step2_duration_ms, step3_duration_ms, end_timestamp, total_duration_ms
+        Line = lists:flatten(
+            io_lib:format(
+                "~s,~p,~p,~p,~s,~p~n",
+                [StartISO, Step1Duration, Step2Duration, Step3Duration, EndISO, TotalDuration]
+            )
+        ),
+
+        %% ファイルが存在しない場合はヘッダーを書き込む
+        case filelib:is_file(FilePath) of
+            false ->
+                Header =
+                    "start_timestamp,step1_duration_ms,step2_duration_ms,step3_duration_ms,end_timestamp,total_duration_ms\n",
+                ok = file:write_file(FilePath, Header, [append]);
+            true ->
+                ok
+        end,
+
+        %% データ行を追加
+        ok = file:write_file(FilePath, Line, [append])
+    catch
+        E:R:S ->
+            ?SLOG(error, #{
+                msg => "error_recording_process_times",
+                error => E,
+                reason => R,
+                stacktrace => S
+            })
+    end.
+
+%% @doc タイムスタンプ（ミリ秒）をISO 8601形式の文字列に変換
+-spec format_timestamp(non_neg_integer()) -> string().
+format_timestamp(TimestampMs) ->
+    %% ミリ秒を秒に変換
+    TimestampS = TimestampMs div 1000,
+    %% ミリ秒の部分を取得
+    Ms = TimestampMs rem 1000,
+
+    %% カレンダー形式に変換
+    {{Year, Month, Day}, {Hour, Min, Sec}} = calendar:system_time_to_universal_time(
+        TimestampS, second
+    ),
+
+    %% ISO 8601形式でフォーマット (YYYY-MM-DDTHH:MM:SS.sssZ)
+    io_lib:format(
+        "~4..0B-~2..0B-~2..0BT~2..0B:~2..0B:~2..0B.~3..0BZ",
+        [Year, Month, Day, Hour, Min, Sec, Ms]
+    ).
