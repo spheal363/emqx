@@ -622,7 +622,7 @@ record_process_times(
             })
     end.
 
-%% @doc タイムスタンプ（ミリ秒）をISO 8601形式の文字列に変換
+%% @doc タイムスタンプ（ミリ秒）をISO 8601形式の文字列に変換（JST時間）
 -spec format_timestamp(non_neg_integer()) -> string().
 format_timestamp(TimestampMs) ->
     %% ミリ秒を秒に変換
@@ -630,13 +630,24 @@ format_timestamp(TimestampMs) ->
     %% ミリ秒の部分を取得
     Ms = TimestampMs rem 1000,
 
-    %% カレンダー形式に変換
+    %% UTC時間を取得
     {{Year, Month, Day}, {Hour, Min, Sec}} = calendar:system_time_to_universal_time(
         TimestampS, second
     ),
 
-    %% ISO 8601形式でフォーマット (YYYY-MM-DDTHH:MM:SS.sssZ)
+    %% UTC時間をグレゴリオ暦秒に変換
+    UTCSeconds = calendar:datetime_to_gregorian_seconds({{Year, Month, Day}, {Hour, Min, Sec}}),
+
+    %% JST（UTC+9時間 = +32400秒）に変換
+    JSTSeconds = UTCSeconds + 32400,
+
+    %% JST時間をdatetimeに変換
+    {{JSTYear, JSTMonth, JSTDay}, {JSTHour, JSTMin, JSTSec}} = calendar:gregorian_seconds_to_datetime(
+        JSTSeconds
+    ),
+
+    %% ISO 8601形式でフォーマット (YYYY-MM-DDTHH:MM:SS.sss+09:00)
     io_lib:format(
-        "~4..0B-~2..0B-~2..0BT~2..0B:~2..0B:~2..0B.~3..0BZ",
-        [Year, Month, Day, Hour, Min, Sec, Ms]
+        "~4..0B-~2..0B-~2..0BT~2..0B:~2..0B:~2..0B.~3..0B+09:00",
+        [JSTYear, JSTMonth, JSTDay, JSTHour, JSTMin, JSTSec, Ms]
     ).
