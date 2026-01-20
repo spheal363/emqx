@@ -27,6 +27,8 @@
     stop/0,
     maybe_redirect_publisher/0,
     find_max_throughput_publisher/0,
+    find_top_throughput_publishers/1,
+    get_connected_publisher_count/0,
     find_low_load_nodes/0,
     get_node_load_util/1,
     format_server_references/1,
@@ -94,29 +96,137 @@ handle_cast(maybe_redirect_publisher, State) ->
 
     case should_redirect(State) of
         true ->
-            %% ①パブリッシャの統計収集→最大スループットパブリッシャ取得
+            %% ①現在接続しているパブリッシャの数を取得
             Step1Start = erlang:monotonic_time(millisecond),
-            Step1Result = find_max_throughput_publisher(),
+            ConnectedCount = get_connected_publisher_count(),
+            %% 10%（切り上げ）の台数を計算
+            RedirectCount =
+                case ConnectedCount of
+                    0 -> 0;
+                    _ -> erlang:ceil(ConnectedCount * 0.1)
+                end,
             Step1Duration = erlang:monotonic_time(millisecond) - Step1Start,
 
-            case Step1Result of
-                {ok, ClientId, Throughput} ->
-                    %% ②クラスタ内の他の全てのブローカにロードアベレージを問い合わせ
+            case RedirectCount of
+                0 ->
+                    ?SLOG(warning, #{
+                        msg => "no_publishers_to_redirect",
+                        connected_count => ConnectedCount
+                    }),
+                    %% CSVに記録（パブリッシャが0台の場合）
+                    EndTimestamp = erlang:system_time(millisecond),
+                    EndTime = erlang:monotonic_time(millisecond),
+                    TotalDuration = EndTime - StartTime,
+                    record_process_times(
+                        StartTimestamp, Step1Duration, 0, 0, EndTimestamp, TotalDuration
+                    ),
+                    {noreply, State#state{last_redirect_time = erlang:system_time(millisecond)}};
+                _ ->
+                    %% ②上位N台のパブリッシャを取得
                     Step2Start = erlang:monotonic_time(millisecond),
-                    Step2Result = find_low_load_nodes(),
+                    Step2Result = find_top_throughput_publishers(RedirectCount),
                     Step2Duration = erlang:monotonic_time(millisecond) - Step2Start,
 
                     case Step2Result of
-                        [] ->
-                            %% 他のノードの情報も取得してログに含める
-                            OtherNodesInfo = get_other_nodes_info(),
+                        {ok, TopPublishers} when length(TopPublishers) > 0 ->
+                            %% ③クラスタ内の他の全てのブローカにロードアベレージを問い合わせ
+                            Step3Start = erlang:monotonic_time(millisecond),
+                            Step3Result = find_low_load_nodes(),
+                            Step3Duration = erlang:monotonic_time(millisecond) - Step3Start,
+
+                            case Step3Result of
+                                [] ->
+                                    %% 他のノードの情報も取得してログに含める
+                                    OtherNodesInfo = get_other_nodes_info(),
+                                    ?SLOG(warning, #{
+                                        msg => "no_low_load_nodes_available",
+                                        publisher_count => length(TopPublishers),
+                                        redirect_count => RedirectCount,
+                                        connected_count => ConnectedCount,
+                                        other_nodes_info => OtherNodesInfo
+                                    }),
+                                    %% CSVに記録（低負荷ノードが見つからなかった場合）
+                                    EndTimestamp = erlang:system_time(millisecond),
+                                    EndTime = erlang:monotonic_time(millisecond),
+                                    TotalDuration = EndTime - StartTime,
+                                    record_process_times(
+                                        StartTimestamp,
+                                        Step1Duration,
+                                        Step2Duration,
+                                        Step3Duration,
+                                        EndTimestamp,
+                                        TotalDuration
+                                    );
+                                LowLoadNodes ->
+                                    %% ④低負荷ブローカのアドレスをServer Referenceに追加→DISCONNECT
+                                    Step4Start = erlang:monotonic_time(millisecond),
+                                    ServerReferences = format_server_references(LowLoadNodes),
+                                    %% 複数のパブリッシャを切断
+                                    DisconnectResults = lists:map(
+                                        fun({ClientId, Throughput}) ->
+                                            Result = disconnect_publisher(
+                                                ClientId, ServerReferences
+                                            ),
+                                            {ClientId, Throughput, Result}
+                                        end,
+                                        TopPublishers
+                                    ),
+                                    Step4Duration = erlang:monotonic_time(millisecond) - Step4Start,
+
+                                    %% 成功と失敗を分けてログ出力
+                                    {SuccessCount, FailedCount} = lists:foldl(
+                                        fun
+                                            ({ClientId, Throughput, ok}, {Suc, Fail}) ->
+                                                ?SLOG(info, #{
+                                                    msg => "publisher_redirected",
+                                                    client_id => ClientId,
+                                                    throughput => Throughput,
+                                                    server_references => ServerReferences,
+                                                    target_nodes => LowLoadNodes
+                                                }),
+                                                {Suc + 1, Fail};
+                                            ({ClientId, _Throughput, {error, Reason}}, {Suc, Fail}) ->
+                                                ?SLOG(error, #{
+                                                    msg => "failed_to_redirect_publisher",
+                                                    client_id => ClientId,
+                                                    reason => Reason
+                                                }),
+                                                {Suc, Fail + 1}
+                                        end,
+                                        {0, 0},
+                                        DisconnectResults
+                                    ),
+                                    ?SLOG(info, #{
+                                        msg => "publishers_redirect_summary",
+                                        total_redirected => length(TopPublishers),
+                                        success_count => SuccessCount,
+                                        failed_count => FailedCount,
+                                        redirect_count => RedirectCount,
+                                        connected_count => ConnectedCount,
+                                        server_references => ServerReferences,
+                                        target_nodes => LowLoadNodes
+                                    }),
+                                    %% CSVに記録
+                                    EndTimestamp = erlang:system_time(millisecond),
+                                    EndTime = erlang:monotonic_time(millisecond),
+                                    TotalDuration = EndTime - StartTime,
+                                    record_process_times(
+                                        StartTimestamp,
+                                        Step1Duration,
+                                        Step2Duration,
+                                        Step3Duration + Step4Duration,
+                                        EndTimestamp,
+                                        TotalDuration
+                                    )
+                            end;
+                        {error, Reason} ->
                             ?SLOG(warning, #{
-                                msg => "no_low_load_nodes_available",
-                                client_id => ClientId,
-                                throughput => Throughput,
-                                other_nodes_info => OtherNodesInfo
+                                msg => "no_publishers_found",
+                                reason => Reason,
+                                redirect_count => RedirectCount,
+                                connected_count => ConnectedCount
                             }),
-                            %% CSVに記録（低負荷ノードが見つからなかった場合）
+                            %% CSVに記録（パブリッシャが見つからなかった場合）
                             EndTimestamp = erlang:system_time(millisecond),
                             EndTime = erlang:monotonic_time(millisecond),
                             TotalDuration = EndTime - StartTime,
@@ -127,57 +237,10 @@ handle_cast(maybe_redirect_publisher, State) ->
                                 0,
                                 EndTimestamp,
                                 TotalDuration
-                            );
-                        LowLoadNodes ->
-                            %% ③低負荷ブローカのアドレスをServer Referenceに追加→DISCONNECT
-                            Step3Start = erlang:monotonic_time(millisecond),
-                            ServerReferences = format_server_references(LowLoadNodes),
-                            Step3Result = disconnect_publisher(ClientId, ServerReferences),
-                            Step3Duration = erlang:monotonic_time(millisecond) - Step3Start,
-
-                            case Step3Result of
-                                ok ->
-                                    ?SLOG(info, #{
-                                        msg => "publisher_redirected",
-                                        client_id => ClientId,
-                                        throughput => Throughput,
-                                        server_references => ServerReferences,
-                                        target_nodes => LowLoadNodes
-                                    });
-                                {error, Reason} ->
-                                    ?SLOG(error, #{
-                                        msg => "failed_to_redirect_publisher",
-                                        client_id => ClientId,
-                                        reason => Reason
-                                    })
-                            end,
-                            %% CSVに記録
-                            EndTimestamp = erlang:system_time(millisecond),
-                            EndTime = erlang:monotonic_time(millisecond),
-                            TotalDuration = EndTime - StartTime,
-                            record_process_times(
-                                StartTimestamp,
-                                Step1Duration,
-                                Step2Duration,
-                                Step3Duration,
-                                EndTimestamp,
-                                TotalDuration
                             )
-                    end;
-                {error, Reason} ->
-                    ?SLOG(warning, #{
-                        msg => "no_publishers_found",
-                        reason => Reason
-                    }),
-                    %% CSVに記録（パブリッシャが見つからなかった場合）
-                    EndTimestamp = erlang:system_time(millisecond),
-                    EndTime = erlang:monotonic_time(millisecond),
-                    TotalDuration = EndTime - StartTime,
-                    record_process_times(
-                        StartTimestamp, Step1Duration, 0, 0, EndTimestamp, TotalDuration
-                    )
-            end,
-            {noreply, State#state{last_redirect_time = erlang:system_time(millisecond)}};
+                    end,
+                    {noreply, State#state{last_redirect_time = erlang:system_time(millisecond)}}
+            end;
         false ->
             {noreply, State}
     end;
@@ -213,6 +276,45 @@ should_redirect(#state{last_redirect_time = LastTime}) ->
             end;
         _ ->
             false
+    end.
+
+%% @doc 現在接続しているパブリッシャの数を取得
+-spec get_connected_publisher_count() -> non_neg_integer().
+get_connected_publisher_count() ->
+    try
+        %% 全publisherの統計を取得
+        AllStats = emqx_publisher_stats:get_publisher_stats(),
+
+        %% 直近10秒のpublish数（スループット）を計算
+        %% タイムスタンプが秒単位かミリ秒単位かを自動判定して処理
+        CurrentTime = erlang:system_time(second),
+        RecentStats = [
+            maps:get(clientid, S)
+         || S <- AllStats,
+            case maps:get(timestamp, S, 0) of
+                Timestamp when Timestamp > 1000000000000 ->
+                    %% ミリ秒単位（13桁以上）
+                    (Timestamp div 1000) >= (CurrentTime - 10);
+                Timestamp when Timestamp > 1000000000 ->
+                    %% 秒単位（10桁）
+                    Timestamp >= (CurrentTime - 10);
+                _ ->
+                    false
+            end
+        ],
+
+        %% ユニークなクライアントIDの数を取得
+        UniqueClients = sets:to_list(sets:from_list(RecentStats)),
+        length(UniqueClients)
+    catch
+        E:R:S ->
+            ?SLOG(error, #{
+                msg => "error_getting_connected_publisher_count",
+                error => E,
+                reason => R,
+                stacktrace => S
+            }),
+            0
     end.
 
 %% @doc 最もスループットが大きいpublisherを特定
@@ -269,6 +371,70 @@ find_max_throughput_publisher() ->
         E:R:S ->
             ?SLOG(error, #{
                 msg => "error_finding_max_throughput_publisher",
+                error => E,
+                reason => R,
+                stacktrace => S
+            }),
+            {error, {E, R}}
+    end.
+
+%% @doc スループットが大きい上位N台のpublisherを特定
+-spec find_top_throughput_publishers(non_neg_integer()) ->
+    {ok, [{binary(), non_neg_integer()}]} | {error, term()}.
+find_top_throughput_publishers(Count) when Count =< 0 ->
+    {error, invalid_count};
+find_top_throughput_publishers(Count) ->
+    try
+        %% 全publisherの統計を取得
+        AllStats = emqx_publisher_stats:get_publisher_stats(),
+
+        %% 直近10秒のpublish数（スループット）を計算
+        %% タイムスタンプが秒単位かミリ秒単位かを自動判定して処理
+        CurrentTime = erlang:system_time(second),
+        RecentStats = [
+            {maps:get(clientid, S), maps:get(publish_count, S, 0)}
+         || S <- AllStats,
+            case maps:get(timestamp, S, 0) of
+                Timestamp when Timestamp > 1000000000000 ->
+                    %% ミリ秒単位（13桁以上）
+                    (Timestamp div 1000) >= (CurrentTime - 10);
+                Timestamp when Timestamp > 1000000000 ->
+                    %% 秒単位（10桁）
+                    Timestamp >= (CurrentTime - 10);
+                _ ->
+                    false
+            end
+        ],
+
+        case RecentStats of
+            [] ->
+                {error, no_recent_publishers};
+            _ ->
+                %% クライアント別のスループットを集計
+                ClientThroughput = lists:foldl(
+                    fun({ClientId, PublishCount}, Acc) ->
+                        maps:update_with(
+                            ClientId, fun(V) -> V + PublishCount end, PublishCount, Acc
+                        )
+                    end,
+                    #{},
+                    RecentStats
+                ),
+                %% スループットでソート（降順）
+                SortedPublishers = lists:reverse(
+                    lists:sort(
+                        fun({_, V1}, {_, V2}) -> V1 =< V2 end,
+                        maps:to_list(ClientThroughput)
+                    )
+                ),
+                %% 上位N台を取得
+                TopPublishers = lists:sublist(SortedPublishers, Count),
+                {ok, TopPublishers}
+        end
+    catch
+        E:R:S ->
+            ?SLOG(error, #{
+                msg => "error_finding_top_throughput_publishers",
                 error => E,
                 reason => R,
                 stacktrace => S
